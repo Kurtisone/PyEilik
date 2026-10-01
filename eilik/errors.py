@@ -6,11 +6,15 @@ __all__ = [
     "AmbiguousPortError",
     "BlacklistedCommandError",
     "ChecksumError",
+    "EilikConnectionError",
     "EilikError",
     "EilikTimeoutError",
     "FrameError",
+    "ImageError",
+    "PortBusyError",
     "PortNotFoundError",
     "ProtocolError",
+    "ServoControllerFaultError",
     "ServoRangeWarning",
     "UnsupportedCommandError",
 ]
@@ -71,8 +75,74 @@ class UnsupportedCommandError(EilikError):
         self.command = command
 
 
+class ImageError(EilikError, ValueError):
+    """A picture could not be decoded or does not have a usable shape."""
+
+
 class EilikTimeoutError(EilikError, TimeoutError):
     """The robot did not answer within the allotted time."""
+
+
+class EilikConnectionError(EilikError, ConnectionError):
+    """The serial link failed underneath an exchange.
+
+    The usual cause is the robot dropping off the USB bus, which the kernel
+    reports as ``ENXIO``. The documented trigger is a servo command and a screen
+    command interleaving without waiting for the acknowledgement in between; the
+    robot then reboots and re-enumerates, so the port has to be reopened.
+    """
+
+    def __init__(self, port: str, cause: BaseException) -> None:
+        """Record the port and the low-level error that broke the link."""
+        super().__init__(
+            f"lost the serial link on {port}: {cause}. If the robot dropped off the USB bus, "
+            "it reboots and comes back; reopen the port. If servo reads then come back as all "
+            "zeros, power-cycle it with the switch on the body"
+        )
+        self.port = port
+        self.cause = cause
+
+
+class PortBusyError(EilikError):
+    """Something else already holds the robot's serial port.
+
+    The port is opened with an exclusive lock because two programs driving the
+    robot at once can interleave a servo frame with a screen frame, which is the
+    documented way to crash its servo controller.
+    """
+
+    def __init__(self, port: str) -> None:
+        """Record the busy port."""
+        super().__init__(
+            f"{port} is already in use, by another program or another connection in this one; "
+            f"two connections driving the robot at once can interleave frames and crash its "
+            f"servo controller. Check with: fuser -v {port}"
+        )
+        self.port = port
+
+
+class ServoControllerFaultError(EilikError):
+    """The servo controller reported every position as zero.
+
+    That is the fault signature of a wedged servo controller, typically after
+    the robot has crashed from interleaved commands: 0xA2 is still acknowledged
+    and 0xA1 still answers with the right motor ids, but every position reads
+    zero and nothing moves. The display keeps working, so the rest of the robot
+    looks healthy.
+
+    Reconnecting does not clear it. Eilik has an internal battery, so unplugging
+    the USB cable leaves the controller running and still wedged; it takes a
+    power cycle with the switch on the body.
+    """
+
+    def __init__(self, positions: dict) -> None:
+        """Record the all-zero reading."""
+        super().__init__(
+            "every servo position reads zero, the signature of a wedged servo controller. "
+            "Power-cycle the robot with the switch on its body; unplugging USB is not enough "
+            "because it runs on its internal battery"
+        )
+        self.positions = dict(positions)
 
 
 class PortNotFoundError(EilikError):

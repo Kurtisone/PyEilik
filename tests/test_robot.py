@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import itertools
+import time
+
 import pytest
 
-from eilik.errors import ProtocolError, ServoRangeWarning
-from eilik.protocol import Command
+from eilik.errors import ProtocolError, ServoControllerFaultError, ServoRangeWarning
+from eilik.protocol import HEARTBEAT_ENVELOPE_PREFIX, Command
 from eilik.robot import Eilik, FirmwareInfo, _extract_text
 from eilik.screen import FRAMEBUFFER_SIZE, blank, get_pixel, rotate180, set_pixel
-from eilik.servo import Motor, ServoLimits
+from eilik.servo import Motor, ServoLimits, decode_servo_payload, linear
 
-from .fake_robot import PING_PAYLOAD, raw_frame
+from .fake_robot import PING_PAYLOAD, device_nonce, raw_frame
 
 
 class TestPing:
@@ -22,6 +25,22 @@ class TestPing:
 
     def test_str_is_a_one_liner(self, robot):
         assert "\n" not in str(robot.ping())
+
+    def test_documented_fields(self, robot):
+        info = robot.ping()
+        assert info.firmware_number == "4424"
+        assert info.boot_firmware == "H090"
+        assert info.identifier == 0x0001925B
+        assert "firmware=4424" in str(info)
+
+    def test_fields_are_none_when_the_layout_does_not_match(self):
+        info = FirmwareInfo(status=0x94, payload=bytes(33), text="")
+        assert info.firmware_number is None
+        assert info.boot_firmware is None
+        assert "firmware=" not in str(info)
+
+    def test_short_payload_has_no_identifier(self):
+        assert FirmwareInfo(status=0x94, payload=b"\x00" * 10, text="").identifier is None
 
     def test_extracts_printable_text(self):
         assert _extract_text(b"\x00\x01EILIK v1.2\xff\x00ab") == "EILIK v1.2"
@@ -37,6 +56,25 @@ class TestPing:
 class TestServos:
     def test_read_returns_all_four_motors(self, robot):
         assert set(robot.read_servos()) == set(Motor)
+
+    def test_all_zero_positions_are_reported_as_a_controller_fault(self, robot, fake_robot):
+        """Zeros in every slot are the wedged-controller signature, not a reading."""
+        fake_robot.servo_fault = True
+        with pytest.raises(ServoControllerFaultError, match="Power-cycle") as excinfo:
+            robot.read_servos()
+        assert excinfo.value.positions == dict.fromkeys(Motor, 0)
+
+    def test_writes_are_still_acknowledged_while_wedged(self, robot, fake_robot):
+        """Which is why the acknowledgement alone cannot reveal the fault."""
+        fake_robot.servo_fault = True
+        assert robot.write_servos({Motor.BODY: 1500}) == {Motor.BODY: 1500}
+
+    def test_a_single_zero_is_not_a_fault(self, robot, fake_robot, monkeypatch):
+        reply = bytes.fromhex("04 010000 02dc05 03dc05 04dc05".replace(" ", ""))
+        monkeypatch.setattr(
+            fake_robot, "_reply_for", lambda *_: raw_frame(Command.READ_SERVOS, reply), raising=True
+        )
+        assert robot.read_servos()[Motor.ARM_RIGHT] == 0
 
     def test_write_then_read_roundtrip(self, robot):
         robot.write_servos({Motor.ARM_RIGHT: 1200, Motor.HEAD: 1600})
@@ -77,6 +115,83 @@ class TestServos:
         )
         with pytest.raises(ProtocolError, match="servo write failed with status 0x00"):
             robot.write_servos({Motor.BODY: 1500})
+
+
+def sent_positions(fake_robot) -> list[dict[Motor, int]]:
+    """Return the positions carried by every 0xA2 frame the fake received."""
+    return [
+        decode_servo_payload(data)
+        for command, data in fake_robot.received
+        if command == Command.WRITE_SERVOS
+    ]
+
+
+class TestMove:
+    def test_glides_to_the_target(self, robot, fake_robot):
+        started = time.monotonic()
+        assert robot.move({Motor.HEAD: 1700}, duration=0.2, rate=50) == {Motor.HEAD: 1700}
+        assert time.monotonic() - started >= 0.18
+        heads = [frame[Motor.HEAD] for frame in sent_positions(fake_robot)]
+        assert len(heads) == 10
+        assert heads == sorted(heads)
+        assert heads[-1] == 1700
+        assert fake_robot.servos[Motor.HEAD] == 1700
+
+    def test_starts_from_the_position_read_back(self, robot, fake_robot):
+        fake_robot.servos[Motor.BODY] = 1300
+        robot.move({Motor.BODY: 1400}, duration=0.04, rate=100, easing=linear)
+        assert fake_robot.received[0] == (Command.READ_SERVOS, b"")
+        assert [frame[Motor.BODY] for frame in sent_positions(fake_robot)] == [
+            1325,
+            1350,
+            1375,
+            1400,
+        ]
+
+    def test_smoothstep_eases_in_and_out(self, robot, fake_robot):
+        robot.move({Motor.ARM_LEFT: 1900}, duration=0.1, rate=100)
+        positions = [1500] + [frame[Motor.ARM_LEFT] for frame in sent_positions(fake_robot)]
+        steps = [b - a for a, b in itertools.pairwise(positions)]
+        assert steps[0] < steps[len(steps) // 2] > steps[-1]
+
+    def test_zero_duration_is_a_single_write(self, robot, fake_robot):
+        robot.move({Motor.HEAD: 1600}, duration=0)
+        assert sent_positions(fake_robot) == [{Motor.HEAD: 1600}]
+
+    def test_unnamed_motors_are_not_sent(self, robot, fake_robot):
+        robot.move({"head": 1550, 3: 1450}, duration=0.03, rate=100)
+        assert all(set(frame) == {Motor.HEAD, Motor.BODY} for frame in sent_positions(fake_robot))
+
+    def test_target_is_clamped(self, robot, fake_robot):
+        assert robot.move({Motor.HEAD: 9999}, duration=0.03, rate=100) == {Motor.HEAD: 1800}
+        assert max(frame[Motor.HEAD] for frame in sent_positions(fake_robot)) == 1800
+
+    def test_warns_once_for_the_target_not_for_every_step(self, fake_robot, transport):
+        instance = Eilik(transport=transport, limits=ServoLimits.widened(HEAD=(1000, 2000)))
+        with pytest.warns(ServoRangeWarning) as record:
+            instance.move({Motor.HEAD: 1950}, duration=0.1, rate=100)
+        assert len(record) == 1
+        assert fake_robot.servos[Motor.HEAD] == 1950
+
+    def test_refuses_to_animate_a_wedged_controller(self, robot, fake_robot):
+        fake_robot.servo_fault = True
+        with pytest.raises(ServoControllerFaultError):
+            robot.move({Motor.HEAD: 1600}, duration=0.1)
+        assert sent_positions(fake_robot) == []
+
+    @pytest.mark.parametrize(
+        ("positions", "options"),
+        [
+            ({Motor.HEAD: 1600}, {"duration": -1}),
+            ({Motor.HEAD: 1600}, {"rate": 0}),
+            ({}, {}),
+            ({"tail": 1500}, {}),
+        ],
+    )
+    def test_bad_arguments_send_nothing(self, robot, fake_robot, positions, options):
+        with pytest.raises(ValueError):
+            robot.move(positions, **options)
+        assert fake_robot.received == []
 
 
 class TestScreen:
@@ -159,7 +274,21 @@ class TestLifecycle:
 
     def test_heartbeat(self, robot, fake_robot):
         robot.heartbeat()
-        assert fake_robot.received[-1][0] == Command.ENVELOPE
+        assert fake_robot.received[-1] == (Command.ENVELOPE, HEARTBEAT_ENVELOPE_PREFIX + b"\xff")
+
+    def test_heartbeat_skips_frames_that_are_not_its_reply(self, robot, fake_robot):
+        fake_robot.inject_before_reply = [raw_frame(Command.READ_SERVOS, b"\x00")]
+        robot.heartbeat()
+
+    def test_heartbeat_reply_must_echo_the_subcommand(self, robot, fake_robot, monkeypatch):
+        monkeypatch.setattr(
+            fake_robot,
+            "_reply_for",
+            lambda *_: raw_frame(Command.ENVELOPE, device_nonce() + b"\x03"),
+            raising=True,
+        )
+        with pytest.raises(ProtocolError, match="does not echo"):
+            robot.heartbeat()
 
     def test_repr_mentions_the_transport(self, robot):
         assert "SerialTransport" in repr(robot)

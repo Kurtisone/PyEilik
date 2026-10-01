@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pyeilik"
-version = "0.1.0"
+version = "0.2.0"
 description = "Pure-Python Linux driver for the Energize Lab Eilik desktop robot"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -12,9 +12,11 @@ license = { text = "MIT" }
 dependencies = ["pyserial>=3.5"]
 
 [project.optional-dependencies]
-dev = ["pytest>=7", "ruff>=0.5"]
+# Pillow is only used by the test suite, to cross-check the built-in PNG decoder.
+dev = ["pytest>=7", "ruff>=0.5", "pillow>=10"]
 
 [project.scripts]
+eilik = "eilik.cli:main"
 eilik-probe = "probe:main"
 
 [tool.setuptools]
@@ -24,6 +26,12 @@ py-modules = ["probe"]
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+
+[tool.ruff.format]
+# Code samples in the README are laid out by hand, with aligned comments; they
+# are documentation, so the formatter (which handles Markdown from ruff 0.16)
+# leaves them alone.
+exclude = ["*.md"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "N", "D", "UP", "B", "C4", "SIM", "RUF", "ARG", "PTH"]

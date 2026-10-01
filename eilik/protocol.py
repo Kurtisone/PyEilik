@@ -30,6 +30,7 @@ __all__ = [
     "HEARTBEAT_ENVELOPE_PREFIX",
     "MAGIC",
     "MAX_FRAME_SIZE",
+    "REFUSED_ENVELOPE_SUBCOMMANDS",
     "Command",
     "Frame",
     "checksum",
@@ -37,6 +38,7 @@ __all__ = [
     "encode_frame",
     "encode_heartbeat",
     "ensure_command_allowed",
+    "ensure_frame_allowed",
 ]
 
 #: Start-of-frame marker.
@@ -69,7 +71,7 @@ class Command(IntEnum):
     """Firmware identification. Read-only."""
 
     ENVELOPE = 0x61
-    """Wrapper carrying a sub-command; only the heartbeat sub-command is used."""
+    """Five-byte nonce plus a sub-command; only the heartbeat sub-command is used."""
 
     READ_SERVOS = 0xA1
     """Read the angles of the four servos. Read-only."""
@@ -111,7 +113,13 @@ BLACKLISTED_COMMANDS: Mapping[int, str] = MappingProxyType(
     }
 )
 
-#: Fixed prefix of the 0x61 envelope payload, observed on every heartbeat frame.
+#: The five-byte nonce that opens every 0x61 payload, as sent with the heartbeat.
+#:
+#: Despite older community notes calling it a session token, the firmware does
+#: not validate this field on input, and it fills it with a fresh value in every
+#: frame it sends. These particular bytes are the reference capture, kept so the
+#: heartbeat matches the golden vector byte for byte. Only this exact value is
+#: allowed out, which keeps the envelope's allowlist down to one known frame.
 HEARTBEAT_ENVELOPE_PREFIX = b"\xe4\xc6\xf1\xca\x83"
 
 #: Sub-command byte carried inside the 0x61 envelope for a heartbeat.
@@ -121,6 +129,17 @@ SUBCOMMAND_HEARTBEAT = 0xFF
 #: opcode inside its payload, so the allowlist has to apply one level deeper as
 #: well, otherwise a destructive sub-command could ride inside a "safe" 0x61.
 SAFE_ENVELOPE_SUBCOMMANDS = frozenset({SUBCOMMAND_HEARTBEAT})
+
+#: Envelope sub-commands refused for a reason of their own. Sub-commands live in
+#: their own namespace: inside 0x61, 0x03 is the legacy single-motor servo
+#: command, not ``content_update``. It moves a motor without going through
+#: :class:`~eilik.servo.ServoLimits`, so it is refused rather than supported;
+#: 0xA2 does the same job with clamping.
+REFUSED_ENVELOPE_SUBCOMMANDS: Mapping[int, str] = MappingProxyType(
+    {
+        0x03: "legacy servo - moves a motor without position clamping; use 0xA2 instead",
+    }
+)
 
 
 def checksum(data: bytes) -> int:
@@ -169,16 +188,42 @@ def _ensure_envelope_payload_allowed(data: bytes) -> None:
     Raises:
         UnsupportedCommandError: If the payload is malformed or carries a
             sub-command outside :data:`SAFE_ENVELOPE_SUBCOMMANDS`.
-        BlacklistedCommandError: If the nested sub-command is blacklisted.
+        BlacklistedCommandError: If the nested sub-command is blacklisted or
+            listed in :data:`REFUSED_ENVELOPE_SUBCOMMANDS`.
     """
-    expected_len = len(HEARTBEAT_ENVELOPE_PREFIX) + 1
-    if len(data) != expected_len or not data.startswith(HEARTBEAT_ENVELOPE_PREFIX):
+    prefix_len = len(HEARTBEAT_ENVELOPE_PREFIX)
+    if len(data) > prefix_len:
+        # Name the sub-command in the refusal whenever there is one to name,
+        # including in payloads too long to be a heartbeat.
+        subcommand = data[prefix_len]
+        if subcommand in REFUSED_ENVELOPE_SUBCOMMANDS:
+            raise BlacklistedCommandError(subcommand, REFUSED_ENVELOPE_SUBCOMMANDS[subcommand])
+        if subcommand in BLACKLISTED_COMMANDS:
+            raise BlacklistedCommandError(subcommand, BLACKLISTED_COMMANDS[subcommand])
+        if subcommand not in SAFE_ENVELOPE_SUBCOMMANDS:
+            raise UnsupportedCommandError(subcommand)
+    if len(data) != prefix_len + 1 or not data.startswith(HEARTBEAT_ENVELOPE_PREFIX):
         raise UnsupportedCommandError(Command.ENVELOPE)
-    subcommand = data[-1]
-    if subcommand in BLACKLISTED_COMMANDS:
-        raise BlacklistedCommandError(subcommand, BLACKLISTED_COMMANDS[subcommand])
-    if subcommand not in SAFE_ENVELOPE_SUBCOMMANDS:
-        raise UnsupportedCommandError(subcommand)
+
+
+def ensure_frame_allowed(command: int, data: bytes) -> None:
+    """Validate a whole outgoing frame: the opcode and, for 0x61, its payload.
+
+    :func:`encode_frame` and the transport's raw write path both call this, so
+    the two apply exactly the same rules.
+
+    Args:
+        command: The opcode.
+        data: The data field, without the command byte or the checksum.
+
+    Raises:
+        BlacklistedCommandError: If the opcode, or the sub-command nested in a
+            0x61 envelope, is destructive or refused.
+        UnsupportedCommandError: If either is outside the allowlist.
+    """
+    ensure_command_allowed(command)
+    if command == Command.ENVELOPE:
+        _ensure_envelope_payload_allowed(data)
 
 
 @dataclass(frozen=True)
@@ -228,9 +273,7 @@ def encode_frame(command: int, data: bytes = b"") -> bytes:
             allowed.
         FrameError: If the resulting frame would exceed :data:`MAX_FRAME_SIZE`.
     """
-    ensure_command_allowed(command)
-    if command == Command.ENVELOPE:
-        _ensure_envelope_payload_allowed(data)
+    ensure_frame_allowed(command, data)
 
     length = len(data) + MIN_LENGTH_FIELD
     if length + 3 > MAX_FRAME_SIZE:
@@ -283,11 +326,11 @@ def encode_heartbeat() -> bytes:
     """Build the heartbeat frame.
 
     The heartbeat is the 0xFF sub-command wrapped in a 0x61 envelope. It is
-    read-only and is the cheapest way to keep the link alive.
+    read-only and the cheapest link check there is. It is not a keep-alive: the
+    link has no session and does not go stale, so nothing needs sending while
+    idle.
 
     Returns:
         The complete heartbeat frame.
     """
-    return encode_frame(
-        Command.ENVELOPE, HEARTBEAT_ENVELOPE_PREFIX + bytes([SUBCOMMAND_HEARTBEAT])
-    )
+    return encode_frame(Command.ENVELOPE, HEARTBEAT_ENVELOPE_PREFIX + bytes([SUBCOMMAND_HEARTBEAT]))

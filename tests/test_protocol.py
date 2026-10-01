@@ -25,6 +25,20 @@ READ_SCREEN_TX = bytes.fromhex("aaaaaa0400a358")
 WRITE_SERVOS_ACK = bytes.fromhex("aaaaaa0500a20157")
 READ_SERVOS_REPLY = bytes.fromhex("aaaaaa1100a10401000002000003000004 00003f".replace(" ", ""))
 
+# Frames sent by a real device, from the community protocol reference
+# (PROTOCOL.md in github.com/aklto/PyEilik). Each heartbeat reply carries a
+# different nonce whose first and last bytes match.
+HEARTBEAT_RX = [
+    bytes.fromhex("aaaaaa0a0061cda02e0bcdff22"),
+    bytes.fromhex("aaaaaa0a0061666a8d1666ffbc"),
+    bytes.fromhex("aaaaaa0a0061fc39e457fcff29"),
+]
+LEGACY_SERVO_ACK = bytes.fromhex("aaaaaa0a00611c0e46451c03c0")
+WRITE_SCREEN_ACK = bytes.fromhex("aaaaaa0500a40155")
+
+# A legacy single-motor servo frame from the official tooling: motor 1 to 2000.
+LEGACY_SERVO_TX = bytes.fromhex("aaaaaa140061fc39e457fc03010101d007000000000041")
+
 
 class TestChecksum:
     """The checksum is 255 minus the low byte of the sum."""
@@ -41,9 +55,32 @@ class TestChecksum:
 
     @pytest.mark.parametrize(
         "frame",
-        [HEARTBEAT_TX, PING_TX, READ_SERVOS_TX, READ_SCREEN_TX, WRITE_SERVOS_ACK,
-         READ_SERVOS_REPLY],
-        ids=["heartbeat", "ping", "read_servos", "read_screen", "servo_ack", "servo_reply"],
+        [
+            HEARTBEAT_TX,
+            PING_TX,
+            READ_SERVOS_TX,
+            READ_SCREEN_TX,
+            WRITE_SERVOS_ACK,
+            READ_SERVOS_REPLY,
+            *HEARTBEAT_RX,
+            LEGACY_SERVO_ACK,
+            WRITE_SCREEN_ACK,
+            LEGACY_SERVO_TX,
+        ],
+        ids=[
+            "heartbeat",
+            "ping",
+            "read_servos",
+            "read_screen",
+            "servo_ack",
+            "servo_reply",
+            "heartbeat_rx_1",
+            "heartbeat_rx_2",
+            "heartbeat_rx_3",
+            "legacy_servo_ack",
+            "screen_ack",
+            "legacy_servo",
+        ],
     )
     def test_golden_vectors_are_self_consistent(self, frame):
         """Every golden vector carries the checksum this implementation computes."""
@@ -129,6 +166,35 @@ class TestDecode:
         assert "READ_SERVOS" in repr(decode_frame(READ_SERVOS_REPLY))
 
 
+class TestRealDeviceCaptures:
+    """Frames a real robot sent decode with this implementation's checksum."""
+
+    @pytest.mark.parametrize("frame", HEARTBEAT_RX, ids=["cda02e", "666a8d", "fc39e4"])
+    def test_heartbeat_replies(self, frame):
+        decoded = decode_frame(frame)
+        assert decoded.command == Command.ENVELOPE
+        nonce, echo = decoded.data[:5], decoded.data[5:]
+        assert echo == b"\xff"
+        assert nonce[0] == nonce[4]
+
+    def test_heartbeat_replies_do_not_reuse_the_transmitted_nonce(self):
+        """The nonce changes in every frame the device sends; it is not a token."""
+        nonces = {decode_frame(frame).data[:5] for frame in HEARTBEAT_RX}
+        assert len(nonces) == len(HEARTBEAT_RX)
+        assert decode_frame(HEARTBEAT_TX).data[:5] not in nonces
+
+    def test_legacy_servo_ack_echoes_the_subcommand(self):
+        assert decode_frame(LEGACY_SERVO_ACK).data[5:] == b"\x03"
+
+    def test_screen_write_ack(self):
+        frame = decode_frame(WRITE_SCREEN_ACK)
+        assert (frame.command, frame.data) == (Command.WRITE_SCREEN, b"\x01")
+
+    def test_legacy_servo_frame_is_well_formed(self):
+        """It decodes, so only the guard stands between it and the wire."""
+        assert decode_frame(LEGACY_SERVO_TX).data[5] == 0x03
+
+
 class TestSafetyGuard:
     """Destructive opcodes cannot be encoded, under any spelling."""
 
@@ -168,6 +234,22 @@ class TestSafetyGuard:
     def test_envelope_rejects_a_malformed_payload(self):
         with pytest.raises(UnsupportedCommandError):
             encode_frame(Command.ENVELOPE, b"\x00\x01\x02")
+
+    def test_envelope_refuses_the_unclamped_legacy_servo_command(self):
+        """Inside 0x61, 0x03 is the legacy servo command, which skips clamping."""
+        data = decode_frame(LEGACY_SERVO_TX).data
+        with pytest.raises(BlacklistedCommandError, match="legacy servo") as excinfo:
+            encode_frame(Command.ENVELOPE, data)
+        assert excinfo.value.command == 0x03
+
+    def test_envelope_allows_only_the_reference_heartbeat(self):
+        """A heartbeat with another nonce works on the robot, but is not needed."""
+        with pytest.raises(UnsupportedCommandError):
+            encode_frame(Command.ENVELOPE, bytes.fromhex("cda02e0bcd") + b"\xff")
+
+    def test_envelope_rejects_trailing_bytes_after_the_heartbeat(self):
+        with pytest.raises(UnsupportedCommandError):
+            encode_frame(Command.ENVELOPE, bytes.fromhex("e4c6f1ca83ff00"))
 
     def test_raw_frame_helper_can_still_build_one(self):
         """The test helper deliberately bypasses the guard.

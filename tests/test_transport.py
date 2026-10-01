@@ -6,17 +6,29 @@ import sys
 import threading
 
 import pytest
+import serial
 
 from eilik.errors import (
     BlacklistedCommandError,
+    EilikConnectionError,
     EilikTimeoutError,
     FrameError,
+    PortBusyError,
     UnsupportedCommandError,
 )
-from eilik.protocol import BLACKLISTED_COMMANDS, Command, encode_frame, encode_heartbeat
+from eilik.protocol import (
+    BLACKLISTED_COMMANDS,
+    HEARTBEAT_ENVELOPE_PREFIX,
+    Command,
+    encode_frame,
+    encode_heartbeat,
+)
 from eilik.transport import DEFAULT_BAUDRATE, SerialTransport, list_candidate_ports
 
-from .fake_robot import raw_frame
+from .fake_robot import device_nonce, raw_frame
+
+#: Legacy servo frame captured from the official tooling: motor 1 to 2000.
+LEGACY_SERVO_TX = bytes.fromhex("aaaaaa140061fc39e457fc03010101d007000000000041")
 
 
 class TestBaudRate:
@@ -68,6 +80,37 @@ class TestWriteGuard:
         with pytest.raises(FrameError):
             transport.send_frame(b"\xaa\xaa\xaa")
 
+    def test_a_destructive_subcommand_nested_in_an_envelope_is_refused(self, transport, fake_robot):
+        """The raw path applies the envelope check too, not just the outer opcode."""
+        with pytest.raises(BlacklistedCommandError) as excinfo:
+            transport.send_frame(raw_frame(Command.ENVELOPE, HEARTBEAT_ENVELOPE_PREFIX + b"\x42"))
+        assert excinfo.value.command == 0x42
+        assert fake_robot.received == []
+
+    def test_the_unclamped_legacy_servo_command_is_refused(self, transport, fake_robot):
+        """A real legacy-servo capture would move a motor with no clamping."""
+        with pytest.raises(BlacklistedCommandError, match="legacy servo"):
+            transport.send_frame(LEGACY_SERVO_TX)
+        assert fake_robot.received == []
+
+    def test_a_destructive_frame_appended_to_a_safe_one_is_refused(self, transport, fake_robot):
+        """Only the first frame's opcode used to be checked."""
+        smuggled = encode_frame(Command.PING) + raw_frame(0x42)
+        with pytest.raises(FrameError, match="well-formed frame"):
+            transport.send_frame(smuggled)
+        assert fake_robot.received == []
+
+    def test_a_frame_with_a_bad_checksum_is_refused(self, transport, fake_robot):
+        damaged = bytearray(encode_frame(Command.PING))
+        damaged[-1] ^= 0xFF
+        with pytest.raises(FrameError, match="checksum"):
+            transport.send_frame(bytes(damaged))
+        assert fake_robot.received == []
+
+    def test_a_frame_shorter_than_its_length_field_is_refused(self, transport):
+        with pytest.raises(FrameError, match="length field"):
+            transport.send_frame(encode_frame(Command.WRITE_SERVOS, b"\x01\x04\xdc\x05")[:-1])
+
 
 class TestRequestResponse:
     """A request waits for the reply carrying the same opcode."""
@@ -97,7 +140,7 @@ class TestRequestResponse:
 
     def test_unsolicited_frames_are_skipped(self, transport, fake_robot):
         """A heartbeat arriving mid-exchange must not be mistaken for the reply."""
-        fake_robot.inject_before_reply = [raw_frame(Command.ENVELOPE, b"\x01")] * 3
+        fake_robot.inject_before_reply = [raw_frame(Command.ENVELOPE, device_nonce() + b"\xff")] * 3
         frame = transport.request(Command.READ_SERVOS)
         assert frame.command == Command.READ_SERVOS
 
@@ -189,6 +232,34 @@ class TestLifecycle:
         link.close()
         link.close()
         assert not link.is_open
+
+    @pytest.mark.usefixtures("transport")  # holds the port open
+    def test_a_second_open_of_the_same_port_is_refused(self, fake_robot):
+        """Two programs on one robot could interleave servo and screen frames."""
+        with pytest.raises(PortBusyError, match="already in use"):
+            SerialTransport(port=fake_robot.port, timeout=1.0)
+
+    def test_the_port_is_free_again_once_closed(self, transport, fake_robot):
+        transport.close()
+        with SerialTransport(port=fake_robot.port, timeout=1.0) as link:
+            assert link.request(Command.PING).command == Command.PING
+
+    @pytest.mark.usefixtures("transport")  # holds the port open
+    def test_exclusive_access_can_be_turned_off(self, fake_robot):
+        with SerialTransport(port=fake_robot.port, timeout=1.0, exclusive=False) as link:
+            assert link.is_open
+
+    def test_a_vanished_device_raises_a_connection_error(self, transport, fake_robot):
+        """Dropping off the USB bus must not look like a mere timeout."""
+        fake_robot.unplug()
+        with pytest.raises(EilikConnectionError, match="lost the serial link") as excinfo:
+            transport.request(Command.PING, timeout=1.0)
+        assert isinstance(excinfo.value, ConnectionError)
+
+    def test_using_a_closed_transport_is_not_reported_as_a_lost_link(self, transport):
+        transport.close()
+        with pytest.raises(serial.PortNotOpenError):
+            transport.request(Command.PING)
 
     def test_candidate_ports_is_a_list_of_strings(self):
         assert all(isinstance(device, str) for device in list_candidate_ports())

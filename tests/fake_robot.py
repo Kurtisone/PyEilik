@@ -10,6 +10,8 @@ from __future__ import annotations
 import contextlib
 import os
 import pty
+import secrets
+import select
 import threading
 import tty
 
@@ -17,8 +19,18 @@ from eilik.protocol import MAGIC, Command, checksum
 from eilik.screen import FRAMEBUFFER_SIZE
 from eilik.servo import Motor
 
-#: Payload the firmware returns after the leading status byte of a ping reply.
-PING_PAYLOAD = bytes(range(0x10, 0x10 + 33))
+#: Payload the firmware returns after the leading status byte of a ping reply,
+#: modelled on the documented one: "4424" and "H090" at offsets 1 and 7, a u32
+#: at offset 11. The reference elides the tail, so this one is zero-filled.
+PING_PAYLOAD = (
+    bytes.fromhex("da") + b"4424" + bytes.fromhex("0e00") + b"H090" + bytes.fromhex("5b9201000d00")
+).ljust(33, b"\x00")
+
+
+def device_nonce() -> bytes:
+    """Return a fresh nonce shaped like the firmware's: first byte == last byte."""
+    head = secrets.token_bytes(4)
+    return head + head[:1]
 
 
 def raw_frame(command: int, data: bytes = b"") -> bytes:
@@ -59,20 +71,41 @@ class FakeEilik:
         self.corrupt_next_reply = False
         #: When set, swallow the next request without replying.
         self.drop_next_request = False
+        #: When set, behave like a wedged servo controller: writes are still
+        #: acknowledged, but every position reads back as zero.
+        self.servo_fault = False
 
         self._stop = threading.Event()
+        # Written to on shutdown, to wake the responder out of select().
+        self._wake_read, self._wake_write = os.pipe()
         self._thread = threading.Thread(target=self._serve, daemon=True)
         self._thread.start()
 
     # -- lifecycle ---------------------------------------------------------
 
+    def _stop_responder(self) -> None:
+        """Stop the responder thread and wait for it to let go of the master."""
+        self._stop.set()
+        with contextlib.suppress(OSError):
+            os.write(self._wake_write, b"\x00")
+        self._thread.join(timeout=2)
+
     def close(self) -> None:
         """Stop the responder and release the pty."""
-        self._stop.set()
-        for fd in (self._master, self._slave):
+        self._stop_responder()
+        for fd in (self._master, self._slave, self._wake_read, self._wake_write):
             with contextlib.suppress(OSError):
                 os.close(fd)
-        self._thread.join(timeout=2)
+
+    def unplug(self) -> None:
+        """Simulate the robot dropping off the bus: the far end of the pty hangs up.
+
+        The responder is stopped before the master is closed, because a thread
+        still blocked on the descriptor would keep the pty open.
+        """
+        self._stop_responder()
+        with contextlib.suppress(OSError):
+            os.close(self._master)
 
     def __enter__(self) -> FakeEilik:
         """Return self, for use as a context manager."""
@@ -91,8 +124,13 @@ class FakeEilik:
             if self._stop.is_set():
                 return None
             try:
+                # Wait on the wake pipe too, so a stop request is noticed
+                # without waiting for the next byte from the transport.
+                ready, _, _ = select.select([self._master, self._wake_read], [], [])
+                if self._master not in ready:
+                    continue
                 chunk = os.read(self._master, count - len(chunks))
-            except OSError:
+            except (OSError, ValueError):
                 return None
             if not chunk:
                 return None
@@ -161,7 +199,14 @@ class FakeEilik:
             return raw_frame(Command.PING, b"\x94" + PING_PAYLOAD)
 
         if command == Command.ENVELOPE:
-            return raw_frame(Command.ENVELOPE, b"\x01")
+            # Echo the sub-command behind a nonce of the firmware's own.
+            return raw_frame(Command.ENVELOPE, device_nonce() + data[-1:])
+
+        if command == Command.READ_SERVOS and self.servo_fault:
+            payload = bytearray([len(self.servos)])
+            for motor in sorted(self.servos):
+                payload.extend((int(motor), 0, 0))
+            return raw_frame(Command.READ_SERVOS, bytes(payload))
 
         if command == Command.READ_SERVOS:
             payload = bytearray([len(self.servos)])

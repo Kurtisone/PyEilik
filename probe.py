@@ -31,6 +31,7 @@ from eilik import (
     Eilik,
     EilikError,
     Motor,
+    ServoControllerFaultError,
     ServoLimits,
     __version__,
     screen,
@@ -57,9 +58,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"nominal line rate (default: {DEFAULT_BAUDRATE}; ignored by CDC-ACM)",
     )
     parser.add_argument("--timeout", type=float, default=2.0, help="reply timeout in seconds")
-    parser.add_argument(
-        "--list", action="store_true", help="list candidate serial ports and exit"
-    )
+    parser.add_argument("--list", action="store_true", help="list candidate serial ports and exit")
     parser.add_argument(
         "--move",
         action="store_true",
@@ -75,9 +74,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="where to save the screen capture (default: eilik-screen.png)",
     )
     parser.add_argument("--no-png", action="store_true", help="skip the screen capture")
-    parser.add_argument(
-        "--ascii", action="store_true", help="also print the screen as ASCII art"
-    )
+    parser.add_argument("--ascii", action="store_true", help="also print the screen as ASCII art")
     parser.add_argument("-v", "--verbose", action="store_true", help="log protocol details")
     return parser
 
@@ -199,15 +196,32 @@ def main(argv: list[str] | None = None) -> int:
         try:
             section("ping (0x01)")
             info = robot.ping()
-            print(f"  status:  0x{info.status:02X}")
-            print(f"  payload: {info.payload.hex(' ')}")
-            if info.text:
-                print(f"  text:    {info.text!r}")
+            print(f"  status:   0x{info.status:02X}")
+            print(f"  payload:  {info.payload.hex(' ')}")
+            # Tentative layout, from one documented device; report what it says.
+            if info.text and info.firmware_number is None:
+                print(f"  text:     {info.text!r}")
+            print(f"  firmware: {info.firmware_number or 'not at the documented offset'}")
+            print(f"  boot:     {info.boot_firmware or 'not at the documented offset'}")
+            if info.identifier is not None:
+                print(f"  id:       0x{info.identifier:08X}")
+
+            section("heartbeat (0x61/0xFF)")
+            robot.heartbeat()
+            print("  echoed")
 
             section("servo read (0xA1)")
-            print(f"  {describe(robot.read_servos())}")
+            servos_ok = True
+            try:
+                print(f"  {describe(robot.read_servos())}")
+            except ServoControllerFaultError as exc:
+                # The display keeps working in this state, so carry on to it.
+                servos_ok = False
+                print(f"  FAULT: {exc}")
 
-            if args.move:
+            if args.move and not servos_ok:
+                print("\nskipping the test movement: the servo controller is wedged")
+            elif args.move:
                 if args.yes or confirm_movement():
                     probe_movement(robot)
                 else:
@@ -220,6 +234,9 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
     section("done")
+    if not servos_ok:
+        print("  the link works, but the servo controller needs a power cycle")
+        return 3
     print("  all requested commands completed")
     return 0
 

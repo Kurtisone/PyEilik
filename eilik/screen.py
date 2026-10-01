@@ -27,6 +27,7 @@ __all__ = [
     "PAGES",
     "WIDTH",
     "blank",
+    "check_size",
     "get_pixel",
     "rotate180",
     "save_png",
@@ -50,8 +51,12 @@ FRAMEBUFFER_SIZE = WIDTH * PAGES
 _BIT_REVERSE = bytes(int(format(value, "08b")[::-1], 2) for value in range(256))
 
 
-def _check_size(framebuffer: bytes) -> None:
-    """Raise :class:`~eilik.errors.ProtocolError` unless the buffer is 1024 bytes."""
+def check_size(framebuffer: bytes) -> None:
+    """Raise :class:`~eilik.errors.ProtocolError` unless the buffer is 1024 bytes.
+
+    Args:
+        framebuffer: The buffer to check.
+    """
     if len(framebuffer) != FRAMEBUFFER_SIZE:
         raise ProtocolError(
             f"framebuffer must be exactly {FRAMEBUFFER_SIZE} bytes, got {len(framebuffer)}"
@@ -78,7 +83,7 @@ def rotate180(framebuffer: bytes) -> bytes:
     Raises:
         ProtocolError: If the buffer is not 1024 bytes.
     """
-    _check_size(framebuffer)
+    check_size(framebuffer)
     return bytes(_BIT_REVERSE[byte] for byte in reversed(framebuffer))
 
 
@@ -170,7 +175,7 @@ def save_png(framebuffer: Sequence[int], path: str, scale: int = 4) -> None:
     """
     if scale < 1:
         raise ValueError(f"scale must be >= 1, got {scale}")
-    _check_size(bytes(framebuffer))
+    check_size(bytes(framebuffer))
 
     width, height = WIDTH * scale, HEIGHT * scale
     raw = bytearray()
