@@ -103,18 +103,22 @@ them at all:
 | `0x41` | `reinit_sd` | reinitialises the SD card |
 | `0x42` | `format_sd` | formats the SD card |
 
-The guard is `eilik.protocol.ensure_command_allowed`, and it is applied at
+The guard is `eilik.protocol.ensure_frame_allowed`, and it is applied at
 **two** independent points:
 
 1. `encode_frame()`, so a destructive frame cannot be built; and
-2. `SerialTransport.send_frame()`, which re-extracts the opcode from the raw
-   bytes, so hand-assembling a frame and calling the low-level write path does
-   not get around it either.
+2. `SerialTransport.send_frame()`, which decodes the raw bytes in full and runs
+   the same check, so hand-assembling a frame and calling the low-level write
+   path does not get around it either. The bytes must be exactly one frame with
+   a valid checksum, so a destructive frame cannot ride behind a harmless one.
 
 It is both a blacklist (`BLACKLISTED_COMMANDS`, with the reason for each entry)
 and an allowlist (only members of the `Command` enum are transmittable), so a
 mistyped opcode is refused as well. The `0x61` envelope nests a second opcode
-inside its payload, so the check is applied one level deeper there too.
+inside its payload, so the check is applied one level deeper there too: the
+only `0x61` frame that can go out is the heartbeat. That also refuses the legacy
+single-motor servo command (`0x03` inside `0x61`), which would move a motor
+without going through the clamping below.
 
 ### Servo limits
 
@@ -153,6 +157,33 @@ processed crashes the servo controller and the robot drops off the USB bus with
 returning, and the transport holds a lock across each whole request/response
 exchange, so frames cannot interleave even across threads.
 
+A lock inside one program cannot stop a second program from talking to the
+robot at the same time, so the port is also opened with an exclusive lock. A
+second connection to the same robot raises `PortBusyError` instead of quietly
+interleaving its frames with yours (`SerialTransport(exclusive=False)` turns
+this off).
+
+## When the robot misbehaves
+
+| symptom | what it raises | what to do |
+|---|---|---|
+| every servo position reads `0` | `ServoControllerFaultError` | power-cycle with the switch on the body |
+| the robot drops off the USB bus | `EilikConnectionError` | reopen the port once it re-enumerates |
+| the port is already open elsewhere | `PortBusyError` | close the other program (`fuser -v /dev/ttyACM0`) |
+| no reply at all | `EilikTimeoutError` | check the cable and `dmesg`; a corrupted frame looks the same |
+
+**All-zero servo positions are a fault, not a reading.** After a crash the servo
+controller can stay wedged: `0xA2` is still acknowledged and `0xA1` still answers
+with the right motor ids, but every position reads zero and nothing moves, while
+the display keeps working normally. `read_servos()` raises rather than returning
+those zeros. Reconnecting does not help, and neither does unplugging the cable:
+**Eilik has an internal battery**, so the controller only resets when you turn
+the robot off with the switch on its body.
+
+**An acknowledgement only means the frame arrived intact.** The firmware
+acknowledges a write to a non-existent motor just the same. To confirm that a
+move happened, read the positions back with `read_servos()`.
+
 ## Protocol reference
 
 Frame layout, identical in both directions:
@@ -182,11 +213,25 @@ error reply, so corruption surfaces as a timeout — which is what
 | cmd | role | direction |
 |---|---|---|
 | `0x01` | ping / firmware identification | read-only |
-| `0x61` | envelope; carries the `0xFF` heartbeat | read-only |
+| `0x61` | nonce + sub-command; only the `0xFF` heartbeat is sent | read-only |
 | `0xA1` | read the four servo angles | read-only |
 | `0xA2` | write servo angles, up to 4 per frame | write |
 | `0xA3` | read the 1024-byte framebuffer | read-only |
 | `0xA4` | write the 1024-byte framebuffer | write |
+
+The protocol is stateless: no handshake, no session, and the link does not go
+stale, so nothing needs sending while idle. The five bytes that open every
+`0x61` payload are a nonce, not a session token. The firmware ignores them on
+input and puts a fresh value in every frame it sends. The heartbeat is
+therefore a link check, not a keep-alive.
+
+The ping reply carries 33 bytes after a status byte. On the device the
+reference documents, `"4424"` (probably the firmware number) sits at offset 1
+and `"H090"` (probably the boot firmware) at offset 7. `FirmwareInfo` exposes
+these as `firmware_number`, `boot_firmware` and `identifier`. They are best
+effort and return `None` when the bytes do not look like that. Some commands
+differ between firmware versions, so check these first when your robot does
+not behave the way someone else's does.
 
 ### Screen format
 
@@ -203,33 +248,46 @@ the byte order of the buffer and the bit order within each byte — which, in pa
 mode, is exactly a half-turn. The operation is its own inverse. Callers of
 `read_screen()` / `write_screen()` always work with buffers the right way up.
 
+Don't expect a write to read back bit for bit. The original SDK's author
+reports that the firmware slightly smooths what it stores, by 58 to 429 pixels
+out of 8192. Nobody has measured this independently yet.
+
 ## Development
 
 ```sh
-python -m pytest        # 171 tests, no hardware required
+python -m pytest        # 205 tests, no hardware required
 ruff check .
 ```
 
-The suite covers the golden frame vectors, checksums, the safety guard, servo
-clamping and the screen rotation, and additionally runs the transport and the
+The suite covers the golden frame vectors (including frames captured from a
+real device), checksums, the safety guard, servo clamping and the screen
+rotation, and additionally runs the transport and the
 high-level API end to end against a **fake robot on a real pty** (see
 `tests/fake_robot.py`) — real file descriptors, real framing, real
 resynchronisation, no hardware attached.
 
 ## Status
 
-Everything here is validated against the documented golden vectors and the
-pty-backed fake, and the custom baud-rate path is confirmed working on Linux.
-**None of it has yet been run against a physical robot**, so the hardware-facing
-details — the exact ping payload layout, the USB VID/PID, real-world timing —
-are still to be confirmed. `probe.py` exists to do exactly that; please report
-what it prints.
+Everything here is validated against the golden vectors and the pty-backed
+fake, and the custom baud-rate path is confirmed working on Linux. The
+implementation has also been checked against the community protocol reference,
+whose findings were verified on a real robot: every frame it quotes decodes with
+this implementation's checksum, and the fake robot answers the way it documents.
+
+**None of this SDK has been run against a physical robot yet**, and the
+reference itself was only exercised on macOS. Still to be confirmed on Linux
+hardware: the ping payload layout, the USB VID/PID (documented nowhere, so not
+hardcoded), and real-world timing. `probe.py` exists to do exactly that;
+please report what it prints. It exits with status 2 if the link works but
+the servo controller reports the all-zero fault.
 
 ## Credits
 
 Protocol documentation reverse-engineered by the community and published at
-<https://eiliksdk.com/protocol/>. The original macOS
-[PyEilik](https://github.com/aklto/PyEilik) established the approach.
+<https://eiliksdk.com/protocol/>; its source is
+[`PROTOCOL.md`](https://github.com/aklto/PyEilik/blob/main/PROTOCOL.md) in the
+original macOS [PyEilik](https://github.com/aklto/PyEilik), which established
+the approach.
 
 ## License
 

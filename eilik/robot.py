@@ -7,8 +7,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 from . import screen as screen_module
-from .errors import ProtocolError
-from .protocol import Command, encode_heartbeat
+from .errors import ProtocolError, ServoControllerFaultError
+from .protocol import HEARTBEAT_ENVELOPE_PREFIX, SUBCOMMAND_HEARTBEAT, Command
 from .servo import (
     Motor,
     ServoLimits,
@@ -26,16 +26,34 @@ _log = logging.getLogger(__name__)
 STATUS_OK = 0x01
 
 
+def _ascii_field(payload: bytes, start: int, end: int) -> str | None:
+    """Return ``payload[start:end]`` as text if it is all printable, else None."""
+    field = payload[start:end]
+    if len(field) != end - start or not all(0x21 <= byte < 0x7F for byte in field):
+        return None
+    return field.decode("ascii")
+
+
 @dataclass(frozen=True)
 class FirmwareInfo:
     """What a 0x01 ping reply tells us.
 
-    Only what is needed to confirm the link is parsed. The remainder of the
-    payload is kept verbatim in :attr:`payload` so callers can dig further
-    without the SDK having to guess at field offsets it has not verified.
+    The payload is kept verbatim in :attr:`payload`. On the firmware documented
+    in the community protocol reference it looks like this, with the field names
+    taken from the manufacturer's own table::
+
+        offset 1..4    "4424"       probably firmware_number
+        offset 7..10   "H090"       probably boot_firmware
+        offset 11..14  u32 LE       looks like an identifier
+
+    That layout has been seen on one device but not pinned down, so the
+    properties exposing it are best effort: each returns None rather than
+    guessing when its bytes do not look like what was observed. Compare these
+    identifiers first when the robot behaves differently from someone else's,
+    since some commands differ between firmware versions.
 
     Attributes:
-        status: Leading byte of the reply's data field.
+        status: Leading byte of the reply's data field (0x94 when observed).
         payload: The rest of the data field, 33 bytes on observed firmware.
         text: Printable ASCII runs of at least four characters found in the
             payload, joined by spaces. Best effort, for display only.
@@ -45,9 +63,33 @@ class FirmwareInfo:
     payload: bytes
     text: str
 
+    @property
+    def firmware_number(self) -> str | None:
+        """Probable firmware number, ``"4424"`` on the documented device."""
+        return _ascii_field(self.payload, 1, 5)
+
+    @property
+    def boot_firmware(self) -> str | None:
+        """Probable boot firmware, ``"H090"`` on the documented device."""
+        return _ascii_field(self.payload, 7, 11)
+
+    @property
+    def identifier(self) -> int | None:
+        """The u32 at payload offset 11 that looks like an identifier."""
+        if len(self.payload) < 15:
+            return None
+        return int.from_bytes(self.payload[11:15], "little")
+
     def __str__(self) -> str:
         """Return a one-line summary."""
-        return f"status=0x{self.status:02X} bytes={len(self.payload)} text={self.text or '-'!r}"
+        parts = [f"status=0x{self.status:02X}"]
+        if self.firmware_number is not None:
+            parts.append(f"firmware={self.firmware_number}")
+        if self.boot_firmware is not None:
+            parts.append(f"boot={self.boot_firmware}")
+        parts.append(f"bytes={len(self.payload)}")
+        parts.append(f"text={self.text or '-'!r}")
+        return " ".join(parts)
 
 
 def _extract_text(payload: bytes, minimum_run: int = 4) -> str:
@@ -96,9 +138,7 @@ class Eilik:
         transport: SerialTransport | None = None,
     ) -> None:
         """Open the link to the robot."""
-        self.transport = transport or SerialTransport(
-            port=port, baudrate=baudrate, timeout=timeout
-        )
+        self.transport = transport or SerialTransport(port=port, baudrate=baudrate, timeout=timeout)
         self.limits = limits or ServoLimits.verified()
 
     # -- lifecycle ---------------------------------------------------------
@@ -144,20 +184,30 @@ class Eilik:
         )
 
     def heartbeat(self, timeout: float | None = None) -> None:
-        """Send a keep-alive heartbeat and wait for its acknowledgement.
+        """Send a heartbeat and wait for the robot to echo it.
+
+        This is the cheapest link check there is. It is not a keep-alive: the
+        protocol has no session and the link does not go stale, so an idle
+        connection needs nothing sent on it.
 
         Args:
             timeout: Seconds to wait for the reply.
 
         Raises:
             EilikTimeoutError: If the robot did not answer.
+            ProtocolError: If the reply does not echo the heartbeat.
         """
-        # Built through the encoder so the nested sub-command is validated, then
-        # handed to the transport, which re-checks the outer opcode.
-        frame = encode_heartbeat()
-        deadline_timeout = timeout if timeout is not None else self.transport.timeout
-        self.transport.send_frame(frame)
-        self.transport.read_frame(timeout=deadline_timeout)
+        # Through request(), like every other exchange, so the transport lock is
+        # held from the write until the matching reply has been read.
+        frame = self.transport.request(
+            Command.ENVELOPE,
+            HEARTBEAT_ENVELOPE_PREFIX + bytes([SUBCOMMAND_HEARTBEAT]),
+            timeout=timeout,
+        )
+        # The reply carries a fresh nonce of the firmware's own, then the echo.
+        expected_size = len(HEARTBEAT_ENVELOPE_PREFIX) + 1
+        if len(frame.data) != expected_size or frame.data[-1] != SUBCOMMAND_HEARTBEAT:
+            raise ProtocolError(f"heartbeat reply does not echo 0xFF: {frame!r}")
 
     def read_servos(self, timeout: float | None = None) -> dict[Motor, int]:
         """Read the current position of every servo.
@@ -171,9 +221,15 @@ class Eilik:
         Raises:
             EilikTimeoutError: If the robot did not answer.
             ProtocolError: If the payload is malformed.
+            ServoControllerFaultError: If every position reads zero, which is
+                the signature of a wedged servo controller rather than a real
+                reading. It needs a power cycle, not a reconnect.
         """
         frame = self.transport.request(Command.READ_SERVOS, timeout=timeout)
-        return decode_servo_payload(frame.data)
+        positions = decode_servo_payload(frame.data)
+        if positions and not any(positions.values()):
+            raise ServoControllerFaultError(positions)
+        return positions
 
     def read_screen(self, timeout: float | None = None) -> bytes:
         """Read the display framebuffer.
@@ -216,7 +272,10 @@ class Eilik:
             timeout: Seconds to wait for the acknowledgement.
 
         Returns:
-            The positions actually sent, after clamping.
+            The positions actually sent, after clamping. The acknowledgement
+            only proves the frame arrived intact (the firmware acknowledges a
+            non-existent motor id just the same), so read the positions back
+            with :meth:`read_servos` to confirm a move.
 
         Raises:
             ValueError: If no motors, more than four, or an unknown motor.

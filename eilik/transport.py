@@ -20,11 +20,15 @@ directly if pyserial's attempt did not stick.
 from __future__ import annotations
 
 import array
+import contextlib
+import errno
 import fcntl
 import logging
 import sys
+import termios
 import threading
 import time
+from collections.abc import Iterator
 from pathlib import Path
 
 import serial
@@ -33,19 +37,20 @@ from serial.tools import list_ports
 from .errors import (
     AmbiguousPortError,
     ChecksumError,
+    EilikConnectionError,
     EilikTimeoutError,
     FrameError,
+    PortBusyError,
     PortNotFoundError,
 )
 from .protocol import (
-    HEADER_SIZE,
     MAGIC,
     MAX_FRAME_SIZE,
     MIN_LENGTH_FIELD,
     Frame,
     decode_frame,
     encode_frame,
-    ensure_command_allowed,
+    ensure_frame_allowed,
 )
 
 __all__ = [
@@ -84,6 +89,15 @@ _CBAUD = 0o010017
 _CFLAG_INDEX = 2
 _ISPEED_INDEX = 9
 _OSPEED_INDEX = 10
+
+#: errno values meaning something else holds the port: a failed exclusive
+#: ``flock`` reports EWOULDBLOCK (EAGAIN on Linux), a busy device EBUSY.
+_BUSY_ERRNOS = frozenset({errno.EAGAIN, errno.EWOULDBLOCK, errno.EBUSY})
+
+#: What the underlying serial port raises when the device goes away mid-use:
+#: pyserial's own exception (an OSError), plain OSError (ENXIO, EIO) and, from
+#: the input-flush path, termios.error.
+_LINK_ERRORS = (OSError, termios.error)
 
 
 def _acm_devices() -> list[str]:
@@ -200,6 +214,15 @@ class SerialTransport:
         baudrate: Nominal line rate; see the module docstring.
         timeout: Default seconds to wait for a reply.
         inter_frame_delay: Minimum pause between consecutive transmissions.
+        exclusive: Take an exclusive lock on the port, so that a second program
+            cannot open the same robot and interleave its frames with ours.
+
+    Raises:
+        PortNotFoundError: If ``port`` is None and no robot is attached.
+        AmbiguousPortError: If ``port`` is None and several candidates exist.
+        PortBusyError: If another connection already holds the port.
+        serial.SerialException: For any other failure to open the port, such
+            as missing permissions.
     """
 
     def __init__(
@@ -208,6 +231,7 @@ class SerialTransport:
         baudrate: int = DEFAULT_BAUDRATE,
         timeout: float = 1.0,
         inter_frame_delay: float = DEFAULT_INTER_FRAME_DELAY,
+        exclusive: bool = True,
     ) -> None:
         """Open the serial port and configure the line rate."""
         self.port = port or autodetect_port()
@@ -219,33 +243,53 @@ class SerialTransport:
         self._rx = bytearray()
 
         try:
-            self._serial = serial.Serial(
-                self.port,
-                baudrate=baudrate,
-                bytesize=serial.EIGHTBITS,
-                parity=serial.PARITY_NONE,
-                stopbits=serial.STOPBITS_ONE,
-                timeout=timeout,
-                write_timeout=timeout,
-            )
+            self._serial = self._open(baudrate, exclusive)
         except ValueError:
             # pyserial refuses the rate up front on platforms without custom-rate
             # support. Open at a standard rate and set the real one by hand; on
             # CDC-ACM the rate is nominal anyway, so this still works.
             _log.debug("pyserial rejected %d baud, opening at 115200 and using termios2", baudrate)
-            self._serial = serial.Serial(
-                self.port,
-                baudrate=115200,
-                bytesize=serial.EIGHTBITS,
-                parity=serial.PARITY_NONE,
-                stopbits=serial.STOPBITS_ONE,
-                timeout=timeout,
-                write_timeout=timeout,
-            )
+            self._serial = self._open(115200, exclusive)
             _apply_termios2_speed(self._serial.fileno(), baudrate)
 
         self._verify_baudrate()
         self.reset_input()
+
+    def _open(self, baudrate: int, exclusive: bool) -> serial.Serial:
+        """Open the port 8N1 at ``baudrate``, translating a busy port.
+
+        Raises:
+            PortBusyError: If another connection holds the port.
+        """
+        try:
+            return serial.Serial(
+                self.port,
+                baudrate=baudrate,
+                bytesize=serial.EIGHTBITS,
+                parity=serial.PARITY_NONE,
+                stopbits=serial.STOPBITS_ONE,
+                timeout=self.timeout,
+                write_timeout=self.timeout,
+                exclusive=exclusive,
+            )
+        except serial.SerialException as exc:
+            if exc.errno in _BUSY_ERRNOS:
+                raise PortBusyError(self.port) from exc
+            raise
+
+    @contextlib.contextmanager
+    def _translate_link_errors(self) -> Iterator[None]:
+        """Turn a failure of the underlying port into :class:`EilikConnectionError`.
+
+        Using the transport after :meth:`close` is a caller error rather than a
+        lost link, so pyserial's own error for it passes through unchanged.
+        """
+        try:
+            yield
+        except serial.PortNotOpenError:
+            raise
+        except _LINK_ERRORS as exc:
+            raise EilikConnectionError(self.port, exc) from exc
 
     def _verify_baudrate(self) -> None:
         """Read the rate back and re-apply it directly if it did not stick."""
@@ -289,39 +333,55 @@ class SerialTransport:
         self.close()
 
     def reset_input(self) -> None:
-        """Discard any bytes already buffered, in the kernel and in this reader."""
+        """Discard any bytes already buffered, in the kernel and in this reader.
+
+        Raises:
+            EilikConnectionError: If the device has gone away.
+        """
         with self._lock:
-            self._serial.reset_input_buffer()
+            with self._translate_link_errors():
+                self._serial.reset_input_buffer()
             self._rx.clear()
 
     # -- transmit ----------------------------------------------------------
 
     def send_frame(self, frame: bytes) -> None:
-        """Write a pre-encoded frame, re-checking the opcode against the guard.
+        """Write a pre-encoded frame, re-validating it against the guard.
 
-        The opcode is extracted from the raw bytes and validated here as well as
-        in :func:`~eilik.protocol.encode_frame`, so hand-assembled bytes cannot
+        The bytes are decoded in full and put through the same
+        :func:`~eilik.protocol.ensure_frame_allowed` check as
+        :func:`~eilik.protocol.encode_frame`, so hand-assembled bytes cannot
         smuggle a destructive command past the blacklist by bypassing the
-        encoder.
+        encoder: not as the opcode, not nested inside a 0x61 envelope, and not
+        as a second frame appended after a harmless one.
 
         Args:
-            frame: A complete frame, magic and checksum included.
+            frame: Exactly one complete frame, magic and checksum included.
 
         Raises:
-            FrameError: If the bytes are not a well-formed frame.
-            BlacklistedCommandError: If the opcode is destructive.
-            UnsupportedCommandError: If the opcode is outside the allowlist.
+            FrameError: If the bytes are not exactly one well-formed frame with
+                a valid checksum.
+            BlacklistedCommandError: If the opcode or a nested sub-command is
+                destructive or refused.
+            UnsupportedCommandError: If either is outside the allowlist.
+            EilikConnectionError: If the write fails because the device has
+                gone away.
         """
-        if len(frame) < HEADER_SIZE + 1 or not frame.startswith(MAGIC):
-            raise FrameError("refusing to transmit bytes that are not a well-formed frame")
-        ensure_command_allowed(frame[5])
+        try:
+            decoded = decode_frame(bytes(frame))
+        except (ChecksumError, FrameError) as exc:
+            raise FrameError(
+                f"refusing to transmit bytes that are not a well-formed frame: {exc}"
+            ) from exc
+        ensure_frame_allowed(decoded.command, decoded.data)
 
         with self._lock:
             pause = self.inter_frame_delay - (time.monotonic() - self._last_write)
             if pause > 0:
                 time.sleep(pause)
-            self._serial.write(frame)
-            self._serial.flush()
+            with self._translate_link_errors():
+                self._serial.write(decoded.raw)
+                self._serial.flush()
             self._last_write = time.monotonic()
 
     # -- receive -----------------------------------------------------------
@@ -389,6 +449,7 @@ class SerialTransport:
 
         Raises:
             EilikTimeoutError: If no complete, valid frame arrived in time.
+            EilikConnectionError: If the device has gone away.
         """
         deadline = time.monotonic() + (self.timeout if timeout is None else timeout)
 
@@ -403,8 +464,9 @@ class SerialTransport:
                     raise EilikTimeoutError(
                         f"timed out waiting for a frame ({len(self._rx)} bytes buffered)"
                     )
-                self._serial.timeout = remaining
-                chunk = self._serial.read(max(1, self._serial.in_waiting))
+                with self._translate_link_errors():
+                    self._serial.timeout = remaining
+                    chunk = self._serial.read(max(1, self._serial.in_waiting))
                 if chunk:
                     self._rx.extend(chunk)
 
@@ -443,6 +505,7 @@ class SerialTransport:
             EilikTimeoutError: If no matching reply arrived. The firmware
                 silently drops frames whose checksum is wrong, so a timeout is
                 also how a corrupted transmission shows up.
+            EilikConnectionError: If the device has gone away.
         """
         expect = command if expect is None else expect
         deadline = time.monotonic() + (self.timeout if timeout is None else timeout)

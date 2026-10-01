@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import pytest
 
-from eilik.errors import ProtocolError, ServoRangeWarning
-from eilik.protocol import Command
+from eilik.errors import ProtocolError, ServoControllerFaultError, ServoRangeWarning
+from eilik.protocol import HEARTBEAT_ENVELOPE_PREFIX, Command
 from eilik.robot import Eilik, FirmwareInfo, _extract_text
 from eilik.screen import FRAMEBUFFER_SIZE, blank, get_pixel, rotate180, set_pixel
 from eilik.servo import Motor, ServoLimits
 
-from .fake_robot import PING_PAYLOAD, raw_frame
+from .fake_robot import PING_PAYLOAD, device_nonce, raw_frame
 
 
 class TestPing:
@@ -22,6 +22,22 @@ class TestPing:
 
     def test_str_is_a_one_liner(self, robot):
         assert "\n" not in str(robot.ping())
+
+    def test_documented_fields(self, robot):
+        info = robot.ping()
+        assert info.firmware_number == "4424"
+        assert info.boot_firmware == "H090"
+        assert info.identifier == 0x0001925B
+        assert "firmware=4424" in str(info)
+
+    def test_fields_are_none_when_the_layout_does_not_match(self):
+        info = FirmwareInfo(status=0x94, payload=bytes(33), text="")
+        assert info.firmware_number is None
+        assert info.boot_firmware is None
+        assert "firmware=" not in str(info)
+
+    def test_short_payload_has_no_identifier(self):
+        assert FirmwareInfo(status=0x94, payload=b"\x00" * 10, text="").identifier is None
 
     def test_extracts_printable_text(self):
         assert _extract_text(b"\x00\x01EILIK v1.2\xff\x00ab") == "EILIK v1.2"
@@ -37,6 +53,25 @@ class TestPing:
 class TestServos:
     def test_read_returns_all_four_motors(self, robot):
         assert set(robot.read_servos()) == set(Motor)
+
+    def test_all_zero_positions_are_reported_as_a_controller_fault(self, robot, fake_robot):
+        """Zeros in every slot are the wedged-controller signature, not a reading."""
+        fake_robot.servo_fault = True
+        with pytest.raises(ServoControllerFaultError, match="Power-cycle") as excinfo:
+            robot.read_servos()
+        assert excinfo.value.positions == dict.fromkeys(Motor, 0)
+
+    def test_writes_are_still_acknowledged_while_wedged(self, robot, fake_robot):
+        """Which is why the acknowledgement alone cannot reveal the fault."""
+        fake_robot.servo_fault = True
+        assert robot.write_servos({Motor.BODY: 1500}) == {Motor.BODY: 1500}
+
+    def test_a_single_zero_is_not_a_fault(self, robot, fake_robot, monkeypatch):
+        reply = bytes.fromhex("04 010000 02dc05 03dc05 04dc05".replace(" ", ""))
+        monkeypatch.setattr(
+            fake_robot, "_reply_for", lambda *_: raw_frame(Command.READ_SERVOS, reply), raising=True
+        )
+        assert robot.read_servos()[Motor.ARM_RIGHT] == 0
 
     def test_write_then_read_roundtrip(self, robot):
         robot.write_servos({Motor.ARM_RIGHT: 1200, Motor.HEAD: 1600})
@@ -159,7 +194,21 @@ class TestLifecycle:
 
     def test_heartbeat(self, robot, fake_robot):
         robot.heartbeat()
-        assert fake_robot.received[-1][0] == Command.ENVELOPE
+        assert fake_robot.received[-1] == (Command.ENVELOPE, HEARTBEAT_ENVELOPE_PREFIX + b"\xff")
+
+    def test_heartbeat_skips_frames_that_are_not_its_reply(self, robot, fake_robot):
+        fake_robot.inject_before_reply = [raw_frame(Command.READ_SERVOS, b"\x00")]
+        robot.heartbeat()
+
+    def test_heartbeat_reply_must_echo_the_subcommand(self, robot, fake_robot, monkeypatch):
+        monkeypatch.setattr(
+            fake_robot,
+            "_reply_for",
+            lambda *_: raw_frame(Command.ENVELOPE, device_nonce() + b"\x03"),
+            raising=True,
+        )
+        with pytest.raises(ProtocolError, match="does not echo"):
+            robot.heartbeat()
 
     def test_repr_mentions_the_transport(self, robot):
         assert "SerialTransport" in repr(robot)
