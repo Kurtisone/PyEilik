@@ -9,11 +9,13 @@ import pytest
 import serial
 
 from eilik.errors import (
+    AmbiguousPortError,
     BlacklistedCommandError,
     EilikConnectionError,
     EilikTimeoutError,
     FrameError,
     PortBusyError,
+    PortNotFoundError,
     UnsupportedCommandError,
 )
 from eilik.protocol import (
@@ -23,7 +25,15 @@ from eilik.protocol import (
     encode_frame,
     encode_heartbeat,
 )
-from eilik.transport import DEFAULT_BAUDRATE, SerialTransport, list_candidate_ports
+from eilik.transport import (
+    DEFAULT_BAUDRATE,
+    EILIK_USB_ID,
+    UDEV_RULE,
+    SerialTransport,
+    autodetect_port,
+    describe_ports,
+    list_candidate_ports,
+)
 
 from .fake_robot import device_nonce, raw_frame
 
@@ -105,6 +115,11 @@ class TestWriteGuard:
         damaged[-1] ^= 0xFF
         with pytest.raises(FrameError, match="checksum"):
             transport.send_frame(bytes(damaged))
+        assert fake_robot.received == []
+
+    def test_an_undocumented_running_number_is_refused(self, transport, fake_robot):
+        with pytest.raises(UnsupportedCommandError, match="no known effect"):
+            transport.send_frame(raw_frame(Command.WRITE_RUNNING_NUMBER, b"\x07"))
         assert fake_robot.received == []
 
     def test_a_frame_shorter_than_its_length_field_is_refused(self, transport):
@@ -269,3 +284,93 @@ def test_encode_frame_and_send_frame_agree(transport):
     """The encoder and the raw write path accept exactly the same opcodes."""
     transport.send_frame(encode_frame(Command.READ_SERVOS))
     assert transport.read_frame(timeout=2.0).command == Command.READ_SERVOS
+
+
+class FakePortInfo:
+    """What pyserial's ``comports()`` reports about one port."""
+
+    def __init__(self, device: str, vid: int | None = None, pid: int | None = None) -> None:
+        """Describe ``device`` with an optional USB ID."""
+        self.device = device
+        self.vid = vid
+        self.pid = pid
+        self.description = "USB device" if vid is not None else "n/a"
+
+
+class TestDiscovery:
+    """Which port auto-detection picks, given what is plugged in."""
+
+    @pytest.fixture
+    def plugged(self, monkeypatch, tmp_path):
+        """Pretend these ports are attached; returns a setter."""
+        monkeypatch.setattr("eilik.transport.UDEV_SYMLINK", tmp_path / "eilik")
+
+        def plug(*ports: FakePortInfo) -> None:
+            acm = sorted(p.device for p in ports if "ttyACM" in p.device)
+            monkeypatch.setattr("eilik.transport._acm_devices", lambda: acm)
+            monkeypatch.setattr("eilik.transport.list_ports.comports", lambda: list(ports))
+
+        return plug
+
+    def test_a_single_acm_device_is_used(self, plugged):
+        plugged(FakePortInfo("/dev/ttyACM0"))
+        assert autodetect_port() == "/dev/ttyACM0"
+
+    def test_the_eilik_usb_id_breaks_a_tie(self, plugged):
+        plugged(
+            FakePortInfo("/dev/ttyACM0", 0x2341, 0x0043),  # an Arduino
+            FakePortInfo("/dev/ttyACM1", *EILIK_USB_ID),
+        )
+        assert autodetect_port() == "/dev/ttyACM1"
+
+    def test_two_robots_are_still_ambiguous(self, plugged):
+        plugged(
+            FakePortInfo("/dev/ttyACM0", *EILIK_USB_ID), FakePortInfo("/dev/ttyACM1", *EILIK_USB_ID)
+        )
+        with pytest.raises(AmbiguousPortError) as excinfo:
+            autodetect_port()
+        assert excinfo.value.candidates == ["/dev/ttyACM0", "/dev/ttyACM1"]
+
+    def test_no_match_lists_every_candidate(self, plugged):
+        plugged(FakePortInfo("/dev/ttyACM0"), FakePortInfo("/dev/ttyACM1"))
+        with pytest.raises(AmbiguousPortError):
+            autodetect_port()
+
+    def test_the_udev_symlink_wins(self, plugged, tmp_path):
+        plugged(FakePortInfo("/dev/ttyACM0"), FakePortInfo("/dev/ttyACM1"))
+        (tmp_path / "eilik").symlink_to("/dev/null")
+        assert autodetect_port() == str(tmp_path / "eilik")
+
+    def test_nothing_plugged_in(self, plugged):
+        plugged()
+        with pytest.raises(PortNotFoundError, match="plug the robot in"):
+            autodetect_port()
+
+    def test_listing_marks_the_robot(self, plugged, tmp_path):
+        plugged(
+            FakePortInfo("/dev/ttyACM0", 0x2341, 0x0043),
+            FakePortInfo("/dev/ttyACM1", *EILIK_USB_ID),
+        )
+        (tmp_path / "eilik").symlink_to("/dev/null")
+        lines = describe_ports()
+        assert "from the udev rule" in lines[0]
+        assert lines[2].endswith("<- Eilik USB ID")
+        assert "28e9:018a" in lines[2]
+        assert "<-" not in lines[1]
+
+
+class TestUdevRule:
+    def test_rule_matches_the_usb_id_and_grants_access(self):
+        rule = [line for line in UDEV_RULE.splitlines() if not line.startswith("#")]
+        assert len(rule) == 1  # one rule, on one line
+        assert 'ATTRS{idVendor}=="28e9"' in rule[0]
+        assert 'ATTRS{idProduct}=="018a"' in rule[0]
+        assert 'TAG+="uaccess"' in rule[0]
+        assert 'SYMLINK+="eilik"' in rule[0]
+        assert 'ENV{ID_MM_DEVICE_IGNORE}="1"' in rule[0]
+
+    def test_cli_prints_it(self, capsys):
+        from eilik.cli import main
+
+        assert main(["udev-rule"]) == 0
+        assert capsys.readouterr().out == UDEV_RULE

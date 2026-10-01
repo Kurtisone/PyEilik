@@ -39,11 +39,14 @@ import tty
 from collections.abc import Mapping
 from types import MappingProxyType
 
+from .canvas import Canvas
 from .protocol import (
     BLACKLISTED_COMMANDS,
     MAGIC,
     MAX_FRAME_SIZE,
     MIN_LENGTH_FIELD,
+    SCREEN_HOLD,
+    SCREEN_RELEASE,
     SUBCOMMAND_HEARTBEAT,
     Command,
     checksum,
@@ -57,6 +60,7 @@ __all__ = [
     "SimulatedEilik",
     "describe_frame",
     "device_nonce",
+    "idle_face",
     "raw_frame",
     "render",
 ]
@@ -81,6 +85,10 @@ _LEGACY_SERVO = 0x03  # sub-command inside 0x61
 
 _MOTOR_IDS = frozenset(int(motor) for motor in Motor)
 
+#: How soon the robot's idle animation repaints over a frame written without
+#: the screen hold, on firmware that needs it (strognoff/eilik-sdk: ~50 ms).
+IDLE_TAKEOVER = 0.05
+
 #: The pair of commands that crash the robot when interleaved.
 _CRASHING_PAIR = frozenset({int(Command.WRITE_SERVOS), int(Command.WRITE_SCREEN)})
 
@@ -89,6 +97,26 @@ def device_nonce() -> bytes:
     """Return a fresh nonce shaped like the firmware's: first byte == last byte."""
     head = secrets.token_bytes(4)
     return head + head[:1]
+
+
+def idle_face(seconds: float) -> bytes:
+    """Return the simulator's stand-in for the robot's own face, ``seconds`` in.
+
+    Two eyes that blink every four seconds and glance left and right. It is
+    drawn here, not copied from the robot: it only shows where the robot's
+    own animation would be on screen.
+    """
+    canvas = Canvas()
+    glance = (0, -6, 0, 6)[int(seconds // 3) % 4]
+    blinking = seconds % 4.0 < 0.15
+    for centre in (42 + glance, 86 + glance):
+        if blinking:
+            canvas.rect(centre - 10, 31, 21, 3, fill=True)
+            continue
+        canvas.circle(centre, 27, 10, fill=True)
+        canvas.circle(centre, 37, 10, fill=True)
+        canvas.rect(centre - 10, 27, 21, 11, fill=True)
+    return bytes(canvas)
 
 
 def raw_frame(command: int, data: bytes = b"") -> bytes:
@@ -110,13 +138,22 @@ class SimulatedEilik:
             frame are sent back to back without waiting for the
             acknowledgement in between.
         servo_fault: Start with a wedged servo controller.
+        idle_face: Show the robot's own animated face whenever the host does
+            not own the screen, as the robot does. Off, the screen simply
+            keeps whatever was last written.
+        hold_required: Model firmware on which a frame written without the
+            screen hold (running number 100) is painted over by the idle
+            animation within :data:`IDLE_TAKEOVER`. Off models the robot
+            ``PROTOCOL.md`` describes, where writing a frame takes the screen.
 
     Attributes:
         port: Device path to open, e.g. ``Eilik(port=sim.port)``.
         servos: Where each servo is heading, or resting. See :meth:`positions`
             for where they are right now.
-        framebuffer: Screen contents as the robot stores them, i.e. rotated;
-            :meth:`screen` returns them the right way up.
+        framebuffer: The last frame the host wrote, as the robot stores it
+            (rotated). :meth:`screen` returns what is actually on screen, the
+            right way up.
+        screen_held: Whether the host holds the screen (running number 100).
         received: Every intact frame received, as ``(command, data)``.
         violations: Human-readable reports of anything that would have hurt a
             real robot: destructive commands, crashing sequences.
@@ -131,7 +168,13 @@ class SimulatedEilik:
     """
 
     def __init__(
-        self, *, slew: bool = True, strict: bool = True, servo_fault: bool = False
+        self,
+        *,
+        slew: bool = True,
+        strict: bool = True,
+        servo_fault: bool = False,
+        idle_face: bool = True,
+        hold_required: bool = True,
     ) -> None:
         """Create the pty pair and start answering on it."""
         self._master, self._slave = pty.openpty()
@@ -140,6 +183,12 @@ class SimulatedEilik:
 
         self.slew = slew
         self.strict = strict
+        self.idle_face = idle_face
+        self.hold_required = hold_required
+        self.screen_held = False
+        # When the host's current frame was written; None once it is gone.
+        self._shown_at: float | None = None
+        self._born = time.monotonic()
         self.servos: dict[Motor, int] = dict.fromkeys(Motor, NEUTRAL_POSITION)
         self.framebuffer = bytearray(FRAMEBUFFER_SIZE)
         self.received: list[tuple[int, bytes]] = []
@@ -217,8 +266,21 @@ class SimulatedEilik:
     # -- observable state ----------------------------------------------------
 
     def screen(self) -> bytes:
-        """Return the screen contents the right way up."""
-        return rotate180(bytes(self.framebuffer))
+        """Return what is on screen right now, the right way up."""
+        now = time.monotonic()
+        if not self.idle_face or self._host_owns_screen(now):
+            return rotate180(bytes(self.framebuffer))
+        return idle_face(now - self._born)
+
+    def screen_owner(self) -> str:
+        """Return ``"host"`` or ``"robot"``: whose picture is on screen."""
+        return "host" if self._host_owns_screen(time.monotonic()) else "robot"
+
+    def _host_owns_screen(self, now: float) -> bool:
+        """Whether the host's frame is still showing, as opposed to the robot's face."""
+        if self._shown_at is None:
+            return False
+        return self.screen_held or now - self._shown_at < IDLE_TAKEOVER
 
     def positions(self) -> dict[Motor, int]:
         """Return where each servo physically is right now."""
@@ -378,18 +440,35 @@ class SimulatedEilik:
             self._write_servos(data)
             return raw_frame(Command.WRITE_SERVOS, b"\x01")
         if command == Command.READ_SCREEN:
-            return raw_frame(Command.READ_SCREEN, b"\x04" + bytes(self.framebuffer))
+            # It reads back what is displayed, the robot's own face included.
+            return raw_frame(Command.READ_SCREEN, b"\x04" + rotate180(self.screen()))
         if command == Command.WRITE_SCREEN:
             if len(data) == FRAMEBUFFER_SIZE:
                 self.framebuffer = bytearray(data)
+                self._shown_at = time.monotonic()
+                if not self.hold_required:
+                    self.screen_held = True  # writing takes the screen
                 self.changes += 1
             return raw_frame(Command.WRITE_SCREEN, b"\x01")
         if command == _READ_RUNNING_NUMBER:
             # No handler on the documented firmware: it answers tagged 0xA4.
             return raw_frame(Command.WRITE_SCREEN, bytes.fromhex("0400ff00ff"))
         if command == _WRITE_RUNNING_NUMBER:
-            return raw_frame(_WRITE_RUNNING_NUMBER, b"\x01")  # acknowledged, inert
+            self._running_number(data[0] if len(data) == 1 else None)
+            return raw_frame(_WRITE_RUNNING_NUMBER, b"\x01")  # acknowledged, whatever the value
         return None  # no handler, no reply
+
+    def _running_number(self, value: int | None) -> None:
+        """Apply a 0xA6 running number: 100 holds the screen, 0 releases it."""
+        if value == SCREEN_HOLD:
+            if not self._host_owns_screen(time.monotonic()):
+                self._shown_at = None  # a frame already painted over stays gone
+            self.screen_held = True
+        elif value == SCREEN_RELEASE:
+            self.screen_held = False
+            self._shown_at = None
+            self.changes += 1
+        # Other values: acknowledged without any modelled effect.
 
     def _envelope(self, data: bytes) -> bytes | None:
         """Answer a 0x61 frame: a five-byte nonce, then a sub-command."""
@@ -437,6 +516,9 @@ def describe_frame(command: int, data: bytes) -> str:
     if command == Command.ENVELOPE and len(data) == 6:
         subcommand = {SUBCOMMAND_HEARTBEAT: "heartbeat", _LEGACY_SERVO: "legacy servo"}
         return f"0x61 {subcommand.get(data[5], f'envelope, sub-command 0x{data[5]:02X}')}"
+    if command == Command.WRITE_RUNNING_NUMBER and len(data) == 1:
+        meaning = {SCREEN_HOLD: "screen hold", SCREEN_RELEASE: "screen release"}
+        return f"0xA6 {meaning.get(data[0], f'running number {data[0]}')}"
     try:
         name = Command(command).name.lower().replace("_", " ")
     except ValueError:
@@ -495,6 +577,11 @@ def render(sim: SimulatedEilik, title: str = "Eilik simulator") -> str:
     else:
         state = "running"
     last = describe_frame(*sim.received[-1]) if sim.received else "none yet"
-    lines.append(f" {state} \u00b7 {len(sim.received)} frames \u00b7 last {last}")
+    owner = sim.screen_owner()
+    screen = "the robot's own face" if owner == "robot" else "the host's"
+    if owner == "host":
+        screen += " (held)" if sim.screen_held else " (until the robot repaints it)"
+    lines.append(f" {state} \u00b7 screen: {screen}")
+    lines.append(f" {len(sim.received)} frames \u00b7 last {last}")
     lines += [f" ! {violation}" for violation in sim.violations[-3:]]
     return "\n".join(lines)

@@ -31,6 +31,9 @@ __all__ = [
     "MAGIC",
     "MAX_FRAME_SIZE",
     "REFUSED_ENVELOPE_SUBCOMMANDS",
+    "RUNNING_NUMBERS",
+    "SCREEN_HOLD",
+    "SCREEN_RELEASE",
     "Command",
     "Frame",
     "checksum",
@@ -85,6 +88,9 @@ class Command(IntEnum):
     WRITE_SCREEN = 0xA4
     """Write the 1024-byte framebuffer."""
 
+    WRITE_RUNNING_NUMBER = 0xA6
+    """Decide who owns the screen; only the values in :data:`RUNNING_NUMBERS`."""
+
 
 # ---------------------------------------------------------------------------
 # Safety: destructive opcodes that must never be emitted
@@ -110,6 +116,24 @@ BLACKLISTED_COMMANDS: Mapping[int, str] = MappingProxyType(
         0x31: "write_specified - writes arbitrary data to the SD card",
         0x41: "reinit_sd - reinitialises the SD card",
         0x42: "format_sd - formats the SD card",
+    }
+)
+
+#: Running number that keeps the host's frames on screen ("user-display mode").
+SCREEN_HOLD = 100
+
+#: Running number that hands the screen back to the robot's own animations.
+SCREEN_RELEASE = 0
+
+#: The only values this SDK sends with 0xA6. The firmware calls the byte a
+#: "running number" and acknowledges any value, but only these two have a known
+#: effect (observed on real robots by strognoff/eilik-sdk and PROTOCOL.md), and
+#: the rest may select stock animations or modes nobody has mapped, so they stay
+#: out of reach like any other undocumented behaviour.
+RUNNING_NUMBERS: Mapping[int, str] = MappingProxyType(
+    {
+        SCREEN_RELEASE: "release the screen to the robot's own animations",
+        SCREEN_HOLD: "user-display mode: keep the host's frames on screen",
     }
 )
 
@@ -224,6 +248,14 @@ def ensure_frame_allowed(command: int, data: bytes) -> None:
     ensure_command_allowed(command)
     if command == Command.ENVELOPE:
         _ensure_envelope_payload_allowed(data)
+    elif command == Command.WRITE_RUNNING_NUMBER and (
+        len(data) != 1 or data[0] not in RUNNING_NUMBERS
+    ):
+        raise UnsupportedCommandError(
+            command,
+            f"running number {data.hex(' ') or '(none)'} has no known effect; "
+            f"only {sorted(RUNNING_NUMBERS)} are sent",
+        )
 
 
 @dataclass(frozen=True)

@@ -10,7 +10,13 @@ from dataclasses import dataclass
 from . import screen as screen_module
 from .canvas import Canvas
 from .errors import ProtocolError, ServoControllerFaultError
-from .protocol import HEARTBEAT_ENVELOPE_PREFIX, SUBCOMMAND_HEARTBEAT, Command
+from .protocol import (
+    HEARTBEAT_ENVELOPE_PREFIX,
+    SCREEN_HOLD,
+    SCREEN_RELEASE,
+    SUBCOMMAND_HEARTBEAT,
+    Command,
+)
 from .servo import (
     Motor,
     ServoLimits,
@@ -367,7 +373,10 @@ class Eilik:
         return targets
 
     def write_screen(
-        self, framebuffer: Sequence[int] | Canvas, timeout: float | None = None
+        self,
+        framebuffer: Sequence[int] | Canvas,
+        timeout: float | None = None,
+        hold: bool = True,
     ) -> None:
         """Replace the display contents.
 
@@ -375,7 +384,10 @@ class Eilik:
             framebuffer: A 1024-byte buffer the right way up, or a
                 :class:`~eilik.canvas.Canvas`; the 180-degree rotation the panel
                 needs is applied here.
-            timeout: Seconds to wait for the acknowledgement.
+            timeout: Seconds to wait for each acknowledgement.
+            hold: Call :meth:`hold_screen` first, so the robot's own idle
+                animation does not paint over the frame. Needed on some
+                firmware, harmless on the rest.
 
         Raises:
             ProtocolError: If the buffer is not 1024 bytes, or the robot
@@ -383,8 +395,44 @@ class Eilik:
             EilikTimeoutError: If the robot did not acknowledge.
         """
         rotated = screen_module.rotate180(bytes(framebuffer))
+        if hold:
+            self.hold_screen(timeout=timeout)
         frame = self.transport.request(Command.WRITE_SCREEN, rotated, timeout=timeout)
         self._check_status(frame.data, "screen write")
+
+    def hold_screen(self, timeout: float | None = None) -> None:
+        """Keep the host's frames on screen ("user-display mode").
+
+        Sends running number 100 with 0xA6. On some firmware the robot's own
+        idle animation repaints the screen within about 50 ms of a frame
+        written without it; on others, writing a frame takes the screen by
+        itself and this is acknowledged without visible effect.
+        :meth:`write_screen` calls it by default.
+
+        Raises:
+            ProtocolError: If the robot reported a failure.
+            EilikTimeoutError: If the robot did not acknowledge.
+        """
+        self._running_number(SCREEN_HOLD, "screen hold", timeout)
+
+    def release_screen(self, timeout: float | None = None) -> None:
+        """Hand the screen back to the robot's own animations.
+
+        Sends running number 0 with 0xA6. Depending on the firmware, what comes
+        back may be the usual idle eyes or a status icon.
+
+        Raises:
+            ProtocolError: If the robot reported a failure.
+            EilikTimeoutError: If the robot did not acknowledge.
+        """
+        self._running_number(SCREEN_RELEASE, "screen release", timeout)
+
+    def _running_number(self, value: int, what: str, timeout: float | None) -> None:
+        """Send one of the allowed 0xA6 running numbers and check the reply."""
+        frame = self.transport.request(
+            Command.WRITE_RUNNING_NUMBER, bytes([value]), timeout=timeout
+        )
+        self._check_status(frame.data, what)
 
     @staticmethod
     def _check_status(data: bytes, what: str) -> None:

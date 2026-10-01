@@ -30,6 +30,7 @@ import time
 from eilik import (
     Eilik,
     EilikError,
+    EilikTimeoutError,
     Motor,
     ServoControllerFaultError,
     ServoLimits,
@@ -37,7 +38,13 @@ from eilik import (
     screen,
 )
 from eilik.servo import describe
-from eilik.transport import DEFAULT_BAUDRATE, default_port, describe_ports
+from eilik.transport import (
+    DEFAULT_BAUDRATE,
+    EILIK_USB_ID,
+    default_port,
+    describe_ports,
+    port_usb_id,
+)
 
 #: How far from neutral the optional test movement travels, in pulse-width units.
 TEST_MOVEMENT_OFFSET = 150
@@ -170,6 +177,12 @@ def main(argv: list[str] | None = None) -> int:
 
     section("connection")
     print(f"  port:     {port}")
+    usb_id = port_usb_id(port)
+    if usb_id is None:
+        print("  usb id:   unknown")
+    else:
+        known = "the Eilik's" if usb_id == EILIK_USB_ID else "not the known Eilik ID"
+        print(f"  usb id:   {usb_id[0]:04x}:{usb_id[1]:04x} ({known})")
     try:
         robot = Eilik(
             port=port,
@@ -182,8 +195,10 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     except OSError as exc:
         print(f"  error: could not open {port}: {exc}")
-        print("  if this is a permissions problem, add yourself to the `uucp` group")
-        print("  (Arch/SteamOS) or `dialout` (Debian/Ubuntu), then log back in")
+        print("  if this is a permissions problem, install the udev rule:")
+        print("    eilik udev-rule | sudo tee /etc/udev/rules.d/70-eilik.rules")
+        print("  or add yourself to the `uucp` group (Arch/SteamOS) or `dialout`")
+        print("  (Debian/Ubuntu), then log back in")
         return 1
 
     with robot:
@@ -207,8 +222,14 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  id:       0x{info.identifier:08X}")
 
             section("heartbeat (0x61/0xFF)")
-            robot.heartbeat()
-            print("  echoed")
+            try:
+                robot.heartbeat()
+                print("  echoed")
+            except EilikTimeoutError:
+                # Reported on real robots: some firmware only answers it after
+                # the official app has talked to the robot. Nothing else needs it.
+                print("  no reply; some firmware versions only answer it after the official")
+                print("  app has run. Nothing else needs it, so carrying on")
 
             section("servo read (0xA1)")
             servos_ok = True
