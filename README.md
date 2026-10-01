@@ -46,15 +46,25 @@ Installing also provides the `eilik` command (or `python -m eilik`).
 
 ### Serial port permissions
 
-Reading `/dev/ttyACM*` needs group membership: `uucp` on Arch/SteamOS, `dialout`
-on Debian/Ubuntu.
+The simplest way is the udev rule the package ships. It gives the logged-in
+user access to the robot (no group to join, no logging out), adds the stable
+name `/dev/eilik`, and keeps ModemManager from probing the robot:
 
 ```sh
-sudo usermod -aG uucp "$USER"   # log out and back in afterwards
+eilik udev-rule | sudo tee /etc/udev/rules.d/70-eilik.rules
+sudo udevadm control --reload-rules && sudo udevadm trigger
+# then unplug the robot and plug it back in
 ```
 
-On SteamOS remember that `/usr` is read-only by default; a `udev` rule belongs in
-`/etc/udev/rules.d/`, which is writable and survives updates.
+On SteamOS, `/etc` is writable and survives system updates (unlike `/usr`);
+`sudo` needs a password, which `passwd` sets in Desktop mode if you have never
+set one. The rule matches the robot's USB ID, `28e9:018a`, which is
+GigaDevice's stock GD32 virtual COM port ID, so other GD32 gadgets would match
+too.
+
+Without the rule, reading `/dev/ttyACM*` needs group membership: `uucp` on
+Arch/SteamOS, `dialout` on Debian/Ubuntu (`sudo usermod -aG uucp "$USER"`, then
+log out and back in).
 
 ## Quick start
 
@@ -76,8 +86,9 @@ with Eilik() as robot:            # auto-detects a single /dev/ttyACM*
     save_png(robot.read_screen(), "screen.png")   # already the right way up
 ```
 
-If several `/dev/ttyACM*` nodes are present, auto-detection refuses to guess and
-raises `AmbiguousPortError`; pass `Eilik(port="/dev/ttyACM1")`, or set the
+Auto-detection takes `/dev/eilik` if the udev rule created it, else the only
+`/dev/ttyACM*` node, else the only one carrying the robot's USB ID. If that
+still leaves several, it refuses to guess and raises `AmbiguousPortError`; pass `Eilik(port="/dev/ttyACM1")`, or set the
 `EILIK_PORT` environment variable, which every entry point honours when no port
 is given. Use `python probe.py --list` to see the candidates with their USB IDs.
 
@@ -109,7 +120,11 @@ the way `PROTOCOL.md` documents the device, including the parts that hurt:
   `0xA6` is acknowledged but inert.
 
 Destructive commands are the one difference: the simulator reports and
-ignores them instead of executing them. Options: `--instant` (no servo
+ignores them instead of executing them. The simulator shows a stand-in for the
+robot's own face whenever the host does not hold the screen, and by default
+behaves like the firmware that needs the screen hold; `--implicit-hold`
+models the robot `PROTOCOL.md` describes, where writing a frame is enough.
+Options: `--instant` (no servo
 travel), `--wedged` (start with the fault), `--lenient` (do not crash on
 interleaving), `--log` (one line per frame instead of the display), `--for
 SECONDS`.
@@ -172,6 +187,25 @@ The font covers printable ASCII and the French accented letters, 21 characters
 per line at scale 1. A character without a glyph is drawn as a hollow box, so
 it shows up instead of silently disappearing. The glyphs live in
 `eilik/font.py` as rows of `#` and `.`, so they can be read and edited in place.
+
+### Who owns the screen
+
+The robot plays its own animations (its eyes) on the screen. Before each
+frame, `write_screen()` asks it to hold the host's picture ("user-display
+mode", running number 100): on some firmware the robot repaints its face
+within about 50 ms otherwise. To give the screen back:
+
+```python
+robot.release_screen()                     # the robot's own face again
+```
+
+```sh
+eilik release
+eilik text "Back in 5 minutes" --for 300   # show it, then give the screen back
+```
+
+Running numbers 100 and 0 are the only values this SDK sends with `0xA6`; see
+[the reverse-engineering notes](docs/REVERSE_ENGINEERING.md) for why.
 
 ## Images
 
@@ -390,12 +424,17 @@ error reply, so corruption surfaces as a timeout — which is what
 | `0xA2` | write servo angles, up to 4 per frame | write |
 | `0xA3` | read the 1024-byte framebuffer | read-only |
 | `0xA4` | write the 1024-byte framebuffer | write |
+| `0xA6` | running number: 100 holds the screen, 0 releases it (no other value) | write |
 
 The protocol is stateless: no handshake, no session, and the link does not go
 stale, so nothing needs sending while idle. The five bytes that open every
 `0x61` payload are a nonce, not a session token. The firmware ignores them on
 input and puts a fresh value in every frame it sends. The heartbeat is
-therefore a link check, not a keep-alive.
+therefore a link check, not a keep-alive. (One project claims a heartbeat
+every 2 seconds stops the robot resuming its autonomous behaviour when idle;
+nobody has shown it, so the SDK sends none. On another project's robot the
+heartbeat got no reply at all until the official app had run, which is why
+nothing here depends on it.)
 
 The ping reply carries 33 bytes after a status byte. On the device the
 reference documents, `"4424"` (probably the firmware number) sits at offset 1
@@ -427,7 +466,7 @@ out of 8192. Nobody has measured this independently yet.
 ## Development
 
 ```sh
-python -m pytest        # 489 tests, no hardware required
+python -m pytest        # 531 tests, no hardware required
 ruff check . && ruff format --check .
 ```
 
@@ -453,6 +492,11 @@ implementation has also been checked against the community protocol reference,
 whose findings were verified on a real robot: every frame it quotes decodes with
 this implementation's checksum, and the simulator answers the way it documents.
 
+The public sources describe at least two firmware behaviours, around the
+heartbeat and the screen hold; the SDK copes with both, and the simulator can
+play either. [docs/REVERSE_ENGINEERING.md](docs/REVERSE_ENGINEERING.md) has
+the details.
+
 **None of this SDK has been run against a physical robot yet**, and the
 reference itself was only exercised on macOS. Still to be confirmed on Linux
 hardware: the ping payload layout, the USB VID/PID (documented nowhere, so not
@@ -466,7 +510,12 @@ Protocol documentation reverse-engineered by the community and published at
 <https://eiliksdk.com/protocol/>; its source is
 [`PROTOCOL.md`](https://github.com/aklto/PyEilik/blob/main/PROTOCOL.md) in the
 original macOS [PyEilik](https://github.com/aklto/PyEilik), which established
-the approach.
+the approach. The USB ID and the screen hold come from
+[strognoff/eilik-sdk](https://github.com/strognoff/eilik-sdk)'s decompilation
+of the official apps and tests on their robot; the original `0x61` work is
+[uDamocles/EilikSerialController](https://github.com/uDamocles/EilikSerialController).
+[docs/REVERSE_ENGINEERING.md](docs/REVERSE_ENGINEERING.md) collects what each
+source found, how sure it is, and where they disagree.
 
 ## License
 
