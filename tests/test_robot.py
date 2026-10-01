@@ -126,6 +126,33 @@ def sent_positions(fake_robot) -> list[dict[Motor, int]]:
     ]
 
 
+class TestScreenOwnership:
+    def test_write_screen_holds_the_screen_first(self, robot, fake_robot):
+        robot.write_screen(blank())
+        assert fake_robot.received == [
+            (Command.WRITE_RUNNING_NUMBER, b"\x64"),
+            (Command.WRITE_SCREEN, bytes(1024)),
+        ]
+
+    def test_hold_can_be_skipped(self, robot, fake_robot):
+        robot.write_screen(blank(), hold=False)
+        assert [command for command, _ in fake_robot.received] == [Command.WRITE_SCREEN]
+
+    def test_release(self, robot, fake_robot):
+        robot.release_screen()
+        assert fake_robot.received == [(Command.WRITE_RUNNING_NUMBER, b"\x00")]
+
+    def test_a_refused_hold_is_reported(self, robot, fake_robot, monkeypatch):
+        monkeypatch.setattr(
+            fake_robot,
+            "_reply_for",
+            lambda *_: raw_frame(Command.WRITE_RUNNING_NUMBER, b"\x00"),
+            raising=True,
+        )
+        with pytest.raises(ProtocolError, match="screen hold failed"):
+            robot.hold_screen()
+
+
 class TestMove:
     def test_glides_to_the_target(self, robot, fake_robot):
         started = time.monotonic()
@@ -262,7 +289,15 @@ class TestMixedCommands:
             robot.write_screen(framebuffer)
 
         commands = [command for command, _ in fake_robot.received]
-        assert commands == [Command.WRITE_SERVOS, Command.WRITE_SCREEN] * 6
+        assert (
+            commands
+            == [
+                Command.WRITE_SERVOS,
+                Command.WRITE_RUNNING_NUMBER,  # the screen hold before each frame
+                Command.WRITE_SCREEN,
+            ]
+            * 6
+        )
         assert fake_robot.servos[Motor.HEAD] == 1450
 
 

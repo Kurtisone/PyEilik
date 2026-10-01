@@ -56,11 +56,15 @@ from .protocol import (
 
 __all__ = [
     "DEFAULT_BAUDRATE",
+    "EILIK_USB_ID",
     "PORT_ENVIRONMENT_VARIABLE",
+    "UDEV_RULE",
+    "UDEV_SYMLINK",
     "SerialTransport",
     "autodetect_port",
     "default_port",
     "list_candidate_ports",
+    "port_usb_id",
 ]
 
 _log = logging.getLogger(__name__)
@@ -71,6 +75,37 @@ DEFAULT_BAUDRATE = 125000
 #: Environment variable naming the port to use when none is given, e.g. a
 #: simulator's, or one robot among several.
 PORT_ENVIRONMENT_VARIABLE = "EILIK_PORT"
+
+#: USB vendor and product ID the robot enumerates with, as observed on a real
+#: robot by the strognoff/eilik-sdk project: GigaDevice's stock GD32 virtual COM
+#: port. Other GD32-based gadgets can share it, so a match makes a port the
+#: likely robot, not certainly the robot.
+EILIK_USB_ID = (0x28E9, 0x018A)
+
+#: Stable device name created by :data:`UDEV_RULE`, tried before scanning.
+UDEV_SYMLINK = Path("/dev/eilik")
+
+#: A udev rule for the robot; ``eilik udev-rule`` prints it.
+UDEV_RULE = f"""\
+# udev rule for the Energize Lab Eilik desktop robot (pyeilik).
+#
+# The robot is a USB CDC-ACM serial device using GigaDevice's stock GD32
+# virtual COM port ID, {EILIK_USB_ID[0]:04x}:{EILIK_USB_ID[1]:04x}. This rule:
+#   - gives the logged-in desktop user access (TAG+="uaccess"), so no group
+#     membership (uucp, dialout) and no logging out and back in is needed;
+#   - adds the stable name {UDEV_SYMLINK}, which pyeilik tries first;
+#   - tells ModemManager to leave the port alone, so it does not probe the
+#     robot with modem commands when it is plugged in.
+# Other GD32-based gadgets with the same ID get the same treatment.
+#
+# Install (on SteamOS, /etc survives system updates):
+#   eilik udev-rule | sudo tee /etc/udev/rules.d/70-eilik.rules
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+# then unplug the robot and plug it back in.
+SUBSYSTEM=="tty", ATTRS{{idVendor}}=="{EILIK_USB_ID[0]:04x}", \
+ATTRS{{idProduct}}=="{EILIK_USB_ID[1]:04x}", TAG+="uaccess", \
+SYMLINK+="{UDEV_SYMLINK.name}", ENV{{ID_MM_DEVICE_IGNORE}}="1"
+"""
 
 #: Directory and glob pattern matching the CDC-ACM nodes the robot shows up on.
 ACM_DIRECTORY = Path("/dev")
@@ -127,10 +162,26 @@ def list_candidate_ports() -> list[str]:
     return acm + sorted(others)
 
 
+def _usb_ids() -> dict[str, tuple[int, int]]:
+    """Map device path to ``(vendor, product)`` for ports with USB metadata."""
+    return {
+        port.device: (port.vid, port.pid)
+        for port in list_ports.comports()
+        if port.vid is not None and port.pid is not None
+    }
+
+
+def port_usb_id(port: str) -> tuple[int, int] | None:
+    """Return ``(vendor, product)`` for ``port``, following symlinks, if known."""
+    return _usb_ids().get(str(Path(port).resolve()))
+
+
 def describe_ports() -> list[str]:
     """Return one human-readable line per known serial port, for diagnostics."""
     known = {port.device: port for port in list_ports.comports()}
     lines = []
+    if UDEV_SYMLINK.exists():
+        lines.append(f"{UDEV_SYMLINK}  -> {UDEV_SYMLINK.resolve()}  (from the udev rule)")
     for device in list_candidate_ports():
         info = known.get(device)
         if info is None:
@@ -138,30 +189,42 @@ def describe_ports() -> list[str]:
             continue
         has_ids = info.vid is not None and info.pid is not None
         vid_pid = f"{info.vid:04x}:{info.pid:04x}" if has_ids else "-"
-        lines.append(f"{device}  {vid_pid}  {info.description}")
+        marker = "  <- Eilik USB ID" if (info.vid, info.pid) == EILIK_USB_ID else ""
+        lines.append(f"{device}  {vid_pid}  {info.description}{marker}")
     return lines
 
 
 def autodetect_port() -> str:
     """Return the single obvious Eilik serial port.
 
+    In order: :data:`UDEV_SYMLINK` if the udev rule created it; the only
+    CDC-ACM node, if there is one; otherwise the only CDC-ACM node carrying
+    :data:`EILIK_USB_ID`.
+
     Returns:
         The device path.
 
     Raises:
         PortNotFoundError: If no CDC-ACM node is present.
-        AmbiguousPortError: If several are, in which case the caller has to pick
-            one; :func:`describe_ports` produces the listing to choose from.
+        AmbiguousPortError: If several are and the USB ID does not single one
+            out, in which case the caller has to pick one;
+            :func:`describe_ports` produces the listing to choose from.
     """
+    if UDEV_SYMLINK.exists():
+        return str(UDEV_SYMLINK)
     candidates = _acm_devices()
     if not candidates:
         raise PortNotFoundError(
             f"no device matching {ACM_GLOB}; plug the robot in and check `dmesg | tail`, "
             f"or set {PORT_ENVIRONMENT_VARIABLE} (e.g. to a simulator's port)"
         )
-    if len(candidates) > 1:
-        raise AmbiguousPortError(candidates)
-    return candidates[0]
+    if len(candidates) == 1:
+        return candidates[0]
+    ids = _usb_ids()
+    matching = [device for device in candidates if ids.get(device) == EILIK_USB_ID]
+    if len(matching) == 1:
+        return matching[0]
+    raise AmbiguousPortError(matching or candidates)
 
 
 def default_port() -> str:

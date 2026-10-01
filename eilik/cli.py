@@ -3,6 +3,8 @@
 Run as ``eilik`` once installed, or ``python -m eilik``::
 
     eilik text "Bonjour !"                 # centred on the screen
+    eilik text "Pause" --for 10            # then give the screen back
+    eilik release                          # the robot's own face again
     eilik show photo.png --dither          # any PNG, fitted to 128x64
     eilik show logo.png --preview          # ASCII preview, no robot needed
     eilik move HEAD=1650 BODY=1400 --duration 1
@@ -11,6 +13,7 @@ Run as ``eilik`` once installed, or ``python -m eilik``::
     eilik capture screen.png
     eilik play cat.gif --loop 3            # animations: GIF, PNG folder, .fb
     eilik simulate                         # a virtual robot, for trying things
+    eilik udev-rule | sudo tee /etc/udev/rules.d/70-eilik.rules
 
 ``eilik simulate`` runs a simulated robot and draws its screen and servos live;
 in another terminal, ``export EILIK_PORT=/tmp/eilik-sim-$UID`` and every command
@@ -43,7 +46,7 @@ from .robot import Eilik
 from .screen import HEIGHT, WIDTH, save_png, to_ascii, to_blocks
 from .servo import Motor, describe, linear, neutral_positions, smoothstep
 from .simulator import SimulatedEilik, describe_frame, render
-from .transport import PORT_ENVIRONMENT_VARIABLE
+from .transport import PORT_ENVIRONMENT_VARIABLE, UDEV_RULE
 
 __all__ = ["main"]
 
@@ -105,6 +108,17 @@ def _add_picture_options(command: argparse.ArgumentParser) -> None:
     command.add_argument("--preview", action="store_true", help="draw it here instead, no robot")
 
 
+def _add_hold_option(command: argparse.ArgumentParser) -> None:
+    """Add ``--for``: show the picture for a while, then release the screen."""
+    command.add_argument(
+        "--for",
+        dest="seconds",
+        type=_duration,
+        metavar="SECONDS",
+        help="keep it on screen this long, then give the screen back to the robot",
+    )
+
+
 def _motor_position(spec: str) -> tuple[Motor, int]:
     """Parse ``NAME=POSITION`` or ``ID=POSITION`` for ``eilik move``."""
     name, separator, value = spec.partition("=")
@@ -147,11 +161,13 @@ def build_parser() -> argparse.ArgumentParser:
     text.add_argument("--x", type=int, help="left edge (default: centred)")
     text.add_argument("--y", type=int, help="top edge (default: centred)")
     text.add_argument("--invert", action="store_true", help="dark text on a lit screen")
+    _add_hold_option(text)
     text.add_argument("--preview", action="store_true", help="draw it here instead, no robot")
 
     show = commands.add_parser("show", help="show a PNG image on the screen")
     show.add_argument("image", help="path to a PNG file")
     _add_picture_options(show)
+    _add_hold_option(show)
 
     play_command = commands.add_parser(
         "play", help="play an animation: a GIF, a folder of PNGs or a .fb stream"
@@ -174,6 +190,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_picture_options(play_command)
 
     commands.add_parser("clear", help="blank the screen")
+    commands.add_parser("release", help="give the screen back to the robot's own animations")
 
     capture = commands.add_parser("capture", help="save the screen contents as a PNG")
     capture.add_argument("output", help="PNG file to write")
@@ -190,6 +207,10 @@ def build_parser() -> argparse.ArgumentParser:
     center = commands.add_parser("center", help="return every servo to neutral")
     center.add_argument("--duration", type=_duration, default=0.5, help="seconds (default: 0.5)")
 
+    commands.add_parser(
+        "udev-rule", help="print a udev rule giving your user access to the robot (Linux)"
+    )
+
     simulate = commands.add_parser("simulate", help="run a virtual robot to try things on")
     simulate.add_argument(
         "--link",
@@ -199,6 +220,11 @@ def build_parser() -> argparse.ArgumentParser:
     simulate.add_argument("--instant", action="store_true", help="servos jump, no travel time")
     simulate.add_argument(
         "--wedged", action="store_true", help="start with a wedged servo controller"
+    )
+    simulate.add_argument(
+        "--implicit-hold",
+        action="store_true",
+        help="writing a frame takes the screen, as on the PROTOCOL.md robot",
     )
     simulate.add_argument(
         "--lenient", action="store_true", help="do not crash on interleaved servo and screen frames"
@@ -240,7 +266,11 @@ def _reboot(crashed: SimulatedEilik, options: dict[str, bool]) -> SimulatedEilik
 def _simulate(args: argparse.Namespace) -> int:
     """Run ``eilik simulate`` until interrupted or ``--for`` elapses."""
     link = Path(args.link)
-    options = {"slew": not args.instant, "strict": not args.lenient}
+    options = {
+        "slew": not args.instant,
+        "strict": not args.lenient,
+        "hold_required": not args.implicit_hold,
+    }
     sim = SimulatedEilik(servo_fault=args.wedged, **options)
     interactive = sys.stdout.isatty() and not args.log
     deadline = None if args.seconds is None else time.monotonic() + args.seconds
@@ -388,10 +418,17 @@ def _run(
     """Carry out ``args.command`` on a connected robot."""
     if picture is not None:
         robot.write_screen(picture)
+        if args.seconds is not None:
+            try:
+                time.sleep(args.seconds)
+            finally:  # Ctrl-C included: do not leave the screen held
+                robot.release_screen()
     elif animation is not None:
         print(play(robot, animation, loops=args.loop, speed=args.speed))
     elif args.command == "clear":
         robot.clear_screen()
+    elif args.command == "release":
+        robot.release_screen()
     elif args.command == "capture":
         framebuffer = robot.read_screen(timeout=max(args.timeout, 5.0))
         save_png(framebuffer, args.output, scale=args.scale)
@@ -423,6 +460,9 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("each motor may appear only once")
     if args.command == "simulate":
         return _simulate(args)
+    if args.command == "udev-rule":
+        print(UDEV_RULE, end="")
+        return 0
 
     try:
         picture = animation = None

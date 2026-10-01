@@ -133,6 +133,36 @@ class TestScreenCommands:
         assert capsys.readouterr().out.startswith("#.")
 
 
+class TestScreenRelease:
+    def test_release(self, fake_robot):
+        assert run(fake_robot, "release") == 0
+        assert fake_robot.received == [(Command.WRITE_RUNNING_NUMBER, b"\x00")]
+
+    def test_text_for_a_while_then_release(self, fake_robot):
+        started = time.monotonic()
+        assert run(fake_robot, "text", "Hi", "--for", "0.2") == 0
+        assert time.monotonic() - started >= 0.2
+        assert [(command, data[:1]) for command, data in fake_robot.received] == [
+            (Command.WRITE_RUNNING_NUMBER, b"\x64"),
+            (Command.WRITE_SCREEN, b"\x00"),
+            (Command.WRITE_RUNNING_NUMBER, b"\x00"),
+        ]
+
+    def test_ctrl_c_still_releases(self, fake_robot, monkeypatch):
+        real_sleep = time.sleep
+        calls = []
+
+        def interrupted(seconds):
+            calls.append(seconds)
+            if seconds == 5:  # the --for wait; the transport's own pauses still sleep
+                raise KeyboardInterrupt
+            real_sleep(seconds)
+
+        monkeypatch.setattr(time, "sleep", interrupted)
+        assert run(fake_robot, "text", "Hi", "--for", "5") == 130
+        assert fake_robot.received[-1] == (Command.WRITE_RUNNING_NUMBER, b"\x00")
+
+
 class TestServoCommands:
     def test_servos(self, fake_robot, capsys):
         fake_robot.servos[Motor.HEAD] = 1620

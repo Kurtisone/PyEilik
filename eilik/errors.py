@@ -66,10 +66,12 @@ class BlacklistedCommandError(EilikError):
 class UnsupportedCommandError(EilikError):
     """An opcode outside the SDK's allowlist was passed to the transport."""
 
-    def __init__(self, command: int) -> None:
-        """Record the unsupported opcode."""
+    def __init__(self, command: int, reason: str | None = None) -> None:
+        """Record the unsupported opcode, and why if it is more specific."""
         super().__init__(
-            f"command 0x{command:02X} is not part of the supported command set; "
+            f"command 0x{command:02X} refused: {reason}"
+            if reason
+            else f"command 0x{command:02X} is not part of the supported command set; "
             "add it to eilik.protocol.Command after verifying it is non-destructive"
         )
         self.command = command

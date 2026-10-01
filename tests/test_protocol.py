@@ -8,6 +8,9 @@ from eilik.errors import BlacklistedCommandError, ChecksumError, FrameError, Uns
 from eilik.protocol import (
     BLACKLISTED_COMMANDS,
     MAX_FRAME_SIZE,
+    RUNNING_NUMBERS,
+    SCREEN_HOLD,
+    SCREEN_RELEASE,
     Command,
     checksum,
     decode_frame,
@@ -257,3 +260,20 @@ class TestSafetyGuard:
         That is what makes the transport-level guard worth testing separately.
         """
         assert raw_frame(0x42)[5] == 0x42
+
+
+class TestRunningNumbers:
+    """0xA6 goes out with the two documented values only."""
+
+    @pytest.mark.parametrize("value", [SCREEN_HOLD, SCREEN_RELEASE])
+    def test_documented_values_are_allowed(self, value):
+        assert encode_frame(Command.WRITE_RUNNING_NUMBER, bytes([value]))[6] == value
+
+    @pytest.mark.parametrize("data", [b"\x05", b"\x01", b"\xff", b"", b"\x64\x00"])
+    def test_anything_else_is_refused(self, data):
+        with pytest.raises(UnsupportedCommandError, match="no known effect"):
+            encode_frame(Command.WRITE_RUNNING_NUMBER, data)
+
+    def test_the_values_are_documented(self):
+        assert set(RUNNING_NUMBERS) == {0, 100}
+        assert all(RUNNING_NUMBERS.values())

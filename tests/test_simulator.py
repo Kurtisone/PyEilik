@@ -13,8 +13,17 @@ from eilik.canvas import Canvas
 from eilik.errors import EilikConnectionError, PortNotFoundError, ServoControllerFaultError
 from eilik.protocol import Command, decode_frame, encode_frame
 from eilik.robot import Eilik
+from eilik.screen import rotate180
 from eilik.servo import Motor
-from eilik.simulator import SLEW_RATES, SimulatedEilik, describe_frame, raw_frame
+from eilik.simulator import (
+    IDLE_TAKEOVER,
+    SLEW_RATES,
+    SimulatedEilik,
+    describe_frame,
+    idle_face,
+    raw_frame,
+    render,
+)
 
 #: A legacy single-motor servo frame from the official tooling: motor 1 to 2000.
 LEGACY_SERVO_TX = bytes.fromhex("aaaaaa140061fc39e457fc03010101d007000000000041")
@@ -311,3 +320,87 @@ class TestDescribeFrame:
     )
     def test_descriptions(self, command, data, expected):
         assert describe_frame(command, data) == expected
+
+
+class TestScreenOwnership:
+    """The robot's own face, the screen hold, and the two firmware behaviours."""
+
+    @staticmethod
+    def wait_past_takeover() -> None:
+        time.sleep(IDLE_TAKEOVER * 3)
+
+    @staticmethod
+    def picture() -> bytes:
+        canvas = Canvas()
+        canvas.rect(0, 0, 128, 64)
+        canvas.text(30, 28, "HOST")
+        return bytes(canvas)
+
+    def test_the_robot_shows_its_own_face_at_first(self, sim):
+        assert sim.screen_owner() == "robot"
+        assert any(sim.screen())
+        with Eilik(port=sim.port) as robot:
+            assert any(robot.read_screen())  # 0xA3 reads back what is displayed
+
+    def test_the_face_blinks_and_glances(self):
+        open_eyes, blink, glance = idle_face(1.0), idle_face(0.05), idle_face(4.0)
+        assert len({open_eyes, blink, glance}) == 3
+        lit = [bin(byte).count("1") for byte in open_eyes]
+        assert sum(lit) > sum(bin(byte).count("1") for byte in blink)
+
+    def test_the_sdk_keeps_its_frame_on_screen(self, sim):
+        with Eilik(port=sim.port) as robot:
+            robot.write_screen(self.picture())
+            self.wait_past_takeover()
+            assert sim.screen() == self.picture()
+            assert sim.screen_owner() == "host"
+
+    def test_a_frame_written_without_the_hold_is_painted_over(self, sim, raw):
+        raw.send(encode_frame(Command.WRITE_SCREEN, rotate180(self.picture())))
+        decode_frame(raw.read())
+        self.wait_past_takeover()
+        assert sim.screen() != self.picture()
+        assert sim.screen_owner() == "robot"
+
+    def test_holding_afterwards_does_not_bring_it_back(self, sim, raw):
+        raw.send(encode_frame(Command.WRITE_SCREEN, rotate180(self.picture())))
+        decode_frame(raw.read())
+        self.wait_past_takeover()
+        with Eilik(port=sim.port) as robot:
+            robot.hold_screen()
+        assert sim.screen() != self.picture()
+
+    def test_release_brings_the_face_back(self, sim):
+        with Eilik(port=sim.port) as robot:
+            robot.write_screen(self.picture())
+            robot.release_screen()
+        assert sim.screen_owner() == "robot"
+        assert not sim.screen_held
+
+    def test_firmware_where_writing_takes_the_screen(self):
+        with SimulatedEilik(hold_required=False) as lenient:
+            link = RawLink(lenient.port)
+            try:
+                link.send(encode_frame(Command.WRITE_SCREEN, rotate180(self.picture())))
+                decode_frame(link.read())
+            finally:
+                link.close()
+            self.wait_past_takeover()
+            assert lenient.screen() == self.picture()
+
+    def test_render_says_who_owns_the_screen(self, sim):
+        assert "screen: the robot's own face" in render(sim)
+        with Eilik(port=sim.port) as robot:
+            robot.write_screen(self.picture())
+        assert "screen: the host's (held)" in render(sim)
+
+    @pytest.mark.parametrize(
+        ("data", "expected"),
+        [
+            (b"\x64", "0xA6 screen hold"),
+            (b"\x00", "0xA6 screen release"),
+            (b"\x07", "0xA6 running number 7"),
+        ],
+    )
+    def test_frame_descriptions(self, data, expected):
+        assert describe_frame(Command.WRITE_RUNNING_NUMBER, data) == expected
