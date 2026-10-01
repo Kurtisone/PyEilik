@@ -19,6 +19,7 @@ Example:
     ...     robot.write_screen(canvas)
 """
 
+from .animation import Animation, PlaybackReport, load_animation, play
 from .canvas import Canvas, text_size
 from .errors import (
     AmbiguousPortError,
@@ -36,6 +37,7 @@ from .errors import (
     ServoRangeWarning,
     UnsupportedCommandError,
 )
+from .gif import load_gif
 from .image import GrayImage, load_png, png_to_framebuffer, to_framebuffer
 from .protocol import (
     BLACKLISTED_COMMANDS,
@@ -78,6 +80,7 @@ __all__ = [
     "VERIFIED_RANGES",
     "WIDTH",
     "AmbiguousPortError",
+    "Animation",
     "BlacklistedCommandError",
     "Canvas",
     "ChecksumError",
@@ -92,6 +95,7 @@ __all__ = [
     "GrayImage",
     "ImageError",
     "Motor",
+    "PlaybackReport",
     "PortBusyError",
     "PortNotFoundError",
     "ProtocolError",
@@ -112,7 +116,10 @@ __all__ = [
     "get_pixel",
     "linear",
     "list_candidate_ports",
+    "load_animation",
+    "load_gif",
     "load_png",
+    "play",
     "png_to_framebuffer",
     "rotate180",
     "save_png",

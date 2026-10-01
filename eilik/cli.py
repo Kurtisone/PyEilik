@@ -9,6 +9,7 @@ Run as ``eilik`` once installed, or ``python -m eilik``::
     eilik center
     eilik servos
     eilik capture screen.png
+    eilik play cat.gif --loop 3            # animations: GIF, PNG folder, .fb
     eilik simulate                         # a virtual robot, for trying things
 
 ``eilik simulate`` runs a simulated robot and draws its screen and servos live;
@@ -17,7 +18,7 @@ above (and any script using the SDK) talks to it instead of a real robot.
 
 Exit status: 0 on success, 1 on an error, 2 on a usage error, 3 when the link
 works but the servo controller reports the all-zero fault and needs a power
-cycle.
+cycle, 130 when interrupted with Ctrl-C.
 """
 
 from __future__ import annotations
@@ -34,6 +35,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from . import __version__
+from .animation import Animation, load_animation, play
 from .canvas import Canvas, text_size
 from .errors import EilikError, ServoControllerFaultError
 from .image import FIT_MODES, png_to_framebuffer
@@ -47,6 +49,9 @@ __all__ = ["main"]
 
 #: Exit status when the servo controller reports the all-zero fault.
 EXIT_SERVO_FAULT = 3
+
+#: Exit status when interrupted with Ctrl-C, as shells report SIGINT.
+EXIT_INTERRUPTED = 130
 
 _EASINGS: dict[str, Callable[[float], float]] = {"smooth": smoothstep, "linear": linear}
 
@@ -76,6 +81,28 @@ def _duration(text: str) -> float:
     if not value >= 0:  # also rejects NaN
         raise argparse.ArgumentTypeError(f"must not be negative, got {text}")
     return value
+
+
+def _positive_float(text: str) -> float:
+    """Parse a strictly positive number."""
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a number, got {text!r}") from None
+    if not value > 0:  # also rejects NaN
+        raise argparse.ArgumentTypeError(f"must be positive, got {text}")
+    return value
+
+
+def _add_picture_options(command: argparse.ArgumentParser) -> None:
+    """Add the options that control how pictures become 1-bit frames."""
+    command.add_argument("--fit", choices=FIT_MODES, default="contain", help="default: contain")
+    command.add_argument("--dither", action="store_true", help="dither; best for photographs")
+    command.add_argument(
+        "--threshold", type=_int_in(0, 256), default=128, help="lit from this luminance (0-256)"
+    )
+    command.add_argument("--invert", action="store_true", help="light the dark parts instead")
+    command.add_argument("--preview", action="store_true", help="draw it here instead, no robot")
 
 
 def _motor_position(spec: str) -> tuple[Motor, int]:
@@ -124,13 +151,27 @@ def build_parser() -> argparse.ArgumentParser:
 
     show = commands.add_parser("show", help="show a PNG image on the screen")
     show.add_argument("image", help="path to a PNG file")
-    show.add_argument("--fit", choices=FIT_MODES, default="contain", help="default: contain")
-    show.add_argument("--dither", action="store_true", help="dither; best for photographs")
-    show.add_argument(
-        "--threshold", type=_int_in(0, 256), default=128, help="lit from this luminance (0-256)"
+    _add_picture_options(show)
+
+    play_command = commands.add_parser(
+        "play", help="play an animation: a GIF, a folder of PNGs or a .fb stream"
     )
-    show.add_argument("--invert", action="store_true", help="light the dark parts instead")
-    show.add_argument("--preview", action="store_true", help="draw it here instead, no robot")
+    play_command.add_argument("source", help="a .gif, a folder of .png files, a .fb or a .png")
+    play_command.add_argument(
+        "--fps",
+        type=_positive_float,
+        help="constant frame rate (default: a GIF's own timing, 12 for PNGs, 30 for .fb)",
+    )
+    play_command.add_argument(
+        "--speed", type=_positive_float, default=1.0, help="2 plays twice as fast"
+    )
+    play_command.add_argument(
+        "--loop", type=_int_in(0), default=1, help="times to play it; 0 repeats until Ctrl-C"
+    )
+    play_command.add_argument(
+        "--motion", metavar="TRACK.mv", help="servo track with one entry per frame"
+    )
+    _add_picture_options(play_command)
 
     commands.add_parser("clear", help="blank the screen")
 
@@ -279,6 +320,49 @@ def _render_text(args: argparse.Namespace) -> Canvas:
     return canvas
 
 
+class _TerminalScreen:
+    """Stands in for the robot under ``play --preview``: draws frames here."""
+
+    def write_screen(self, framebuffer: bytes) -> None:
+        sys.stdout.write("\x1b[H" + to_blocks(framebuffer))
+        sys.stdout.flush()
+
+    def write_servos(self, positions: dict[Motor, int]) -> None:
+        """Servo targets have nothing to move in a terminal."""
+
+    def move(self, positions: dict[Motor, int], duration: float = 0.5) -> None:
+        """Servo targets have nothing to move in a terminal."""
+
+
+def _load_animation(args: argparse.Namespace) -> Animation:
+    """Load the animation named on the command line."""
+    return load_animation(
+        args.source,
+        fps=args.fps,
+        motion=args.motion,
+        fit=args.fit,
+        threshold=args.threshold,
+        dither=args.dither,
+        invert=args.invert,
+    )
+
+
+def _preview_animation(animation: Animation, args: argparse.Namespace) -> None:
+    """Play the animation in the terminal, or summarise it when not on one."""
+    summary = f"{len(animation)} frames, {animation.duration / args.speed:.2f}s per pass"
+    if not sys.stdout.isatty():
+        print(summary)
+        print(to_blocks(animation.frames[0]))
+        return
+    sys.stdout.write("\x1b[?1049h\x1b[?25l\x1b[2J")
+    try:
+        report = play(_TerminalScreen(), animation, loops=args.loop, speed=args.speed)
+    finally:
+        sys.stdout.write("\x1b[?25h\x1b[?1049l")
+        sys.stdout.flush()
+    print(f"{summary}; {report}")
+
+
 def _render_image(args: argparse.Namespace) -> Canvas:
     """Load and convert the image."""
     return Canvas(
@@ -295,10 +379,17 @@ def _render_image(args: argparse.Namespace) -> Canvas:
 # -- commands that talk to the robot ---------------------------------------------
 
 
-def _run(robot: Eilik, args: argparse.Namespace, picture: Canvas | None) -> None:
+def _run(
+    robot: Eilik,
+    args: argparse.Namespace,
+    picture: Canvas | None,
+    animation: Animation | None,
+) -> None:
     """Carry out ``args.command`` on a connected robot."""
     if picture is not None:
         robot.write_screen(picture)
+    elif animation is not None:
+        print(play(robot, animation, loops=args.loop, speed=args.speed))
     elif args.command == "clear":
         robot.clear_screen()
     elif args.command == "capture":
@@ -334,17 +425,25 @@ def main(argv: list[str] | None = None) -> int:
         return _simulate(args)
 
     try:
-        picture = None
+        picture = animation = None
         if args.command == "text":
             picture = _render_text(args)
         elif args.command == "show":
             picture = _render_image(args)
+        elif args.command == "play":
+            animation = _load_animation(args)
         if picture is not None and args.preview:
             print(to_blocks(bytes(picture)))
             return 0
+        if animation is not None and args.preview:
+            _preview_animation(animation, args)
+            return 0
 
         with Eilik(port=args.port, timeout=args.timeout) as robot:
-            _run(robot, args, picture)
+            _run(robot, args, picture, animation)
+    except KeyboardInterrupt:
+        print("stopped", file=sys.stderr)
+        return EXIT_INTERRUPTED
     except ServoControllerFaultError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_SERVO_FAULT
