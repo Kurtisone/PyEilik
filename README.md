@@ -77,8 +77,54 @@ with Eilik() as robot:            # auto-detects a single /dev/ttyACM*
 ```
 
 If several `/dev/ttyACM*` nodes are present, auto-detection refuses to guess and
-raises `AmbiguousPortError`; pass `Eilik(port="/dev/ttyACM1")`. Use
-`python probe.py --list` to see the candidates with their USB IDs.
+raises `AmbiguousPortError`; pass `Eilik(port="/dev/ttyACM1")`, or set the
+`EILIK_PORT` environment variable, which every entry point honours when no port
+is given. Use `python probe.py --list` to see the candidates with their USB IDs.
+
+## No robot yet? The simulator
+
+`eilik simulate` runs a virtual Eilik that speaks the real protocol over a
+pseudo-terminal and draws its screen and servos live:
+
+```sh
+eilik simulate                              # terminal 1: the virtual robot
+export EILIK_PORT=/tmp/eilik-sim-$UID       # terminal 2: talk to it
+eilik text "Bonjour !"
+eilik move HEAD=1700 ARM_LEFT=1200 --duration 1
+python probe.py
+python my_script.py                         # any script using the SDK
+```
+
+Everything runs unchanged against a real robot later. The simulator behaves
+the way `PROTOCOL.md` documents the device, including the parts that hurt:
+
+* servos travel at the measured speeds (arms 3000 units/s, body and head
+  1450), so a read during a move sees it in progress;
+* a servo frame and a screen frame sent without waiting for the
+  acknowledgement crash it. It drops off the bus and comes back on a new
+  port with its servo controller wedged (all positions read 0, nothing moves)
+  until you restart it, which is the power cycle. The `/tmp/eilik-sim-$UID`
+  link follows it;
+* bad checksums are ignored without a reply, `0xA5` answers tagged `0xA4`,
+  `0xA6` is acknowledged but inert.
+
+Destructive commands are the one difference: the simulator reports and
+ignores them instead of executing them. Options: `--instant` (no servo
+travel), `--wedged` (start with the fault), `--lenient` (do not crash on
+interleaving), `--log` (one line per frame instead of the display), `--for
+SECONDS`.
+
+In Python the same thing is `eilik.SimulatedEilik`, handy in your own tests:
+
+```python
+from eilik import Eilik, Motor, SimulatedEilik
+
+with SimulatedEilik() as sim, Eilik(port=sim.port) as robot:
+    robot.move({Motor.HEAD: 1650}, duration=0.5)
+    assert sim.servos[Motor.HEAD] == 1650  # the target; sim.positions() is where
+                                           # the joints are now, still travelling
+    assert sim.violations == []            # nothing that would hurt a real robot
+```
 
 ## Command line
 
@@ -92,14 +138,15 @@ eilik center
 eilik servos
 eilik capture screen.png --ascii
 eilik clear
+eilik play cat.gif --loop 3                # animations, see below
+eilik simulate                             # a virtual robot, see above
 ```
 
-`text` and `show` take `--preview` to print the result as ASCII art instead of
-sending it, which needs no robot at all, so a picture can be tuned before the
-robot is even plugged in. Motors are named `arm_right`, `arm_left`, `body`,
-`head` (any case) or numbered 1 to 4. The exit status is 0 on success, 1 on an
-error, 2 on a usage error and 3 when the servo controller reports the all-zero
-fault described below.
+`text`, `show` and `play` take `--preview` to draw the result in the terminal
+instead of sending it, which needs no robot at all. Motors are named
+`arm_right`, `arm_left`, `body`, `head` (any case) or numbered 1 to 4. The exit
+status is 0 on success, 1 on an error, 2 on a usage error, 3 when the servo
+controller reports the all-zero fault described below, and 130 after Ctrl-C.
 
 ## Drawing and text
 
@@ -167,6 +214,36 @@ second on a fixed schedule, easing in and out by default. Targets are clamped
 once up front, so widened limits warn once rather than at every step. Because
 it starts from a read-back, `move()` refuses to run on a wedged servo
 controller instead of animating a robot that will not move.
+
+## Animations
+
+```sh
+eilik play cat.gif                          # keeps the GIF's own timing
+eilik play frames/ --fps 15 --loop 0        # PNGs in name order, until Ctrl-C
+eilik play cat.gif --dither --preview       # watch it in the terminal first
+eilik play movie.fb --motion movie.mv       # streams from the reference tools
+```
+
+```python
+from eilik import load_animation, play
+
+animation = load_animation("cat.gif", dither=True)
+print(play(robot, animation, loops=3))     # "72 frames in 4.80s (15.0 fps), 0 dropped"
+```
+
+Animated GIFs are decoded in pure Python, transparency and frame disposal
+included. A folder of PNGs plays in natural order (`2.png` before `10.png`).
+`.fb` and `.mv` are the formats of the original macOS tools: there,
+`tools/video2fb.py` turns a video into a `.fb` frame stream and
+`tools/audio2motion.py` derives a `.mv` dance track from its soundtrack, and
+both files play here unchanged. `Animation.save_fb()` writes them too.
+
+Playback keeps an absolute schedule: a frame whose time has passed is dropped
+rather than shown late, so one slow moment does not push the rest of the
+animation behind. Every write waits for its acknowledgement, so the screen and
+the motion track can never interleave into the crash described below. Servo
+targets go out every third frame, and the joints glide back to neutral at the
+end.
 
 ## Bring-up probe
 
@@ -350,7 +427,7 @@ out of 8192. Nobody has measured this independently yet.
 ## Development
 
 ```sh
-python -m pytest        # 379 tests, no hardware required
+python -m pytest        # 489 tests, no hardware required
 ruff check . && ruff format --check .
 ```
 
@@ -359,20 +436,22 @@ Python 3.10 to 3.14.
 
 The suite covers the golden frame vectors (including frames captured from a
 real device), checksums, the safety guard, servo clamping, the screen rotation,
-drawing, the PNG decoder and the command line. The decoder is checked against
-an independent test-side encoder covering every filter, colour type and depth,
-and against Pillow. The suite additionally runs the transport, the CLI and the
-high-level API end to end against a **fake robot on a real pty** (see
-`tests/fake_robot.py`) — real file descriptors, real framing, real
-resynchronisation, no hardware attached.
+drawing, the PNG and GIF decoders, animation playback and the command line.
+The PNG decoder is checked against an independent test-side encoder covering
+every filter, colour type and depth, and against Pillow; GIF compositing
+against frames encoded by Pillow and against the specification. The suite
+runs the transport, the CLI and the high-level API end to end against the
+**simulator on a real pty** — real file descriptors, real framing, real
+resynchronisation, no hardware attached. Its strict mode stays on, so a
+regression that let frames interleave would crash it and fail the tests.
 
 ## Status
 
-Everything here is validated against the golden vectors and the pty-backed
-fake, and the custom baud-rate path is confirmed working on Linux. The
+Everything here is validated against the golden vectors and the simulator, and
+the custom baud-rate path is confirmed working on Linux. The
 implementation has also been checked against the community protocol reference,
 whose findings were verified on a real robot: every frame it quotes decodes with
-this implementation's checksum, and the fake robot answers the way it documents.
+this implementation's checksum, and the simulator answers the way it documents.
 
 **None of this SDK has been run against a physical robot yet**, and the
 reference itself was only exercised on macOS. Still to be confirmed on Linux
