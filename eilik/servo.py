@@ -27,6 +27,9 @@ __all__ = [
     "ServoLimits",
     "decode_servo_payload",
     "encode_servo_payload",
+    "linear",
+    "resolve_positions",
+    "smoothstep",
 ]
 
 
@@ -125,12 +128,14 @@ class ServoLimits:
             ranges[motor] = (int(low), int(high))
         return cls(MappingProxyType(ranges))
 
-    def clamp(self, motor: Motor, position: int) -> int:
+    def clamp(self, motor: Motor, position: int, warn: bool = True) -> int:
         """Clamp ``position`` for ``motor`` and warn when leaving safe ground.
 
         Args:
             motor: The motor the position is destined for.
             position: The requested pulse width.
+            warn: Emit the warning below. Only turned off for the intermediate
+                steps of a movement whose target has already been checked.
 
         Returns:
             The position actually safe to transmit.
@@ -151,13 +156,13 @@ class ServoLimits:
         clamped = min(max(position, low), high)
 
         verified_low, verified_high = VERIFIED_RANGES[motor]
-        if not verified_low <= clamped <= verified_high:
+        if warn and not verified_low <= clamped <= verified_high:
             warnings.warn(
                 f"{motor.name} position {clamped} is outside the verified range "
                 f"{verified_low}-{verified_high}; this risks driving the servo into a "
                 f"mechanical stop",
                 ServoRangeWarning,
-                stacklevel=3,
+                stacklevel=4,
             )
 
         if not ENCODABLE_RANGE[0] <= clamped <= ENCODABLE_RANGE[1]:
@@ -186,18 +191,20 @@ def _coerce_motor(key: object) -> Motor:
     raise ValueError(f"cannot interpret {key!r} as a motor")
 
 
-def encode_servo_payload(
+def resolve_positions(
     positions: Mapping[object, int],
     limits: ServoLimits | None = None,
-) -> bytes:
-    """Build the data field of a 0xA2 frame.
+    warn: bool = True,
+) -> dict[Motor, int]:
+    """Validate a position mapping and clamp it to ``limits``.
 
     Args:
         positions: Motor (as a :class:`Motor`, an id or a name) to pulse width.
         limits: Limits to apply. Defaults to :meth:`ServoLimits.verified`.
+        warn: Passed on to :meth:`ServoLimits.clamp`.
 
     Returns:
-        ``<count> <id, position_lo, position_hi> * count``.
+        :class:`Motor` to the clamped position.
 
     Raises:
         ValueError: If ``positions`` is empty, holds more than
@@ -211,7 +218,7 @@ def encode_servo_payload(
         motor = _coerce_motor(key)
         if motor in resolved:
             raise ValueError(f"motor {motor.name} specified more than once")
-        resolved[motor] = limits.clamp(motor, position)
+        resolved[motor] = limits.clamp(motor, position, warn=warn)
 
     if not resolved:
         raise ValueError("no motor positions supplied")
@@ -219,7 +226,28 @@ def encode_servo_payload(
         raise ValueError(
             f"at most {MAX_MOTORS_PER_FRAME} motors fit in one frame, got {len(resolved)}"
         )
+    return resolved
 
+
+def encode_servo_payload(
+    positions: Mapping[object, int],
+    limits: ServoLimits | None = None,
+    warn: bool = True,
+) -> bytes:
+    """Build the data field of a 0xA2 frame.
+
+    Args:
+        positions: Motor (as a :class:`Motor`, an id or a name) to pulse width.
+        limits: Limits to apply. Defaults to :meth:`ServoLimits.verified`.
+        warn: Passed on to :meth:`ServoLimits.clamp`.
+
+    Returns:
+        ``<count> <id, position_lo, position_hi> * count``.
+
+    Raises:
+        ValueError: As :func:`resolve_positions`.
+    """
+    resolved = resolve_positions(positions, limits, warn=warn)
     payload = bytearray([len(resolved)])
     for motor in sorted(resolved):
         payload.append(int(motor))
@@ -269,6 +297,20 @@ def decode_servo_payload(data: bytes) -> dict[Motor, int]:
 def describe(positions: Mapping[Motor, int]) -> str:
     """Return a one-line human-readable summary of a servo position mapping."""
     return ", ".join(f"{motor.name}={positions[motor]}" for motor in sorted(positions))
+
+
+def linear(progress: float) -> float:
+    """Constant-speed easing: progress maps to itself."""
+    return progress
+
+
+def smoothstep(progress: float) -> float:
+    """Ease in and out: start and stop gently, fastest halfway.
+
+    Mechanically kinder than :func:`linear`, which starts and stops the joint
+    at full speed.
+    """
+    return progress * progress * (3 - 2 * progress)
 
 
 def neutral_positions(motors: Iterable[Motor] | None = None) -> dict[Motor, int]:

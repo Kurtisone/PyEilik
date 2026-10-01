@@ -10,12 +10,16 @@ firmware or the SD card are listed in
 bytes can reach the serial port.
 
 Example:
-    >>> from eilik import Eilik, Motor
+    >>> from eilik import Canvas, Eilik, Motor
     >>> with Eilik() as robot:  # doctest: +SKIP
     ...     print(robot.ping())
-    ...     robot.write_servos({Motor.HEAD: 1600})
+    ...     robot.move({Motor.HEAD: 1600}, duration=0.5)
+    ...     canvas = Canvas()
+    ...     canvas.text(0, 0, "Bonjour")
+    ...     robot.write_screen(canvas)
 """
 
+from .canvas import Canvas, text_size
 from .errors import (
     AmbiguousPortError,
     BlacklistedCommandError,
@@ -24,6 +28,7 @@ from .errors import (
     EilikError,
     EilikTimeoutError,
     FrameError,
+    ImageError,
     PortBusyError,
     PortNotFoundError,
     ProtocolError,
@@ -31,6 +36,7 @@ from .errors import (
     ServoRangeWarning,
     UnsupportedCommandError,
 )
+from .image import GrayImage, load_png, png_to_framebuffer, to_framebuffer
 from .protocol import (
     BLACKLISTED_COMMANDS,
     Command,
@@ -51,7 +57,7 @@ from .screen import (
     save_png,
     set_pixel,
 )
-from .servo import NEUTRAL_POSITION, VERIFIED_RANGES, Motor, ServoLimits
+from .servo import NEUTRAL_POSITION, VERIFIED_RANGES, Motor, ServoLimits, linear, smoothstep
 from .transport import DEFAULT_BAUDRATE, SerialTransport, autodetect_port, list_candidate_ports
 
 __version__ = "0.1.0"
@@ -66,6 +72,7 @@ __all__ = [
     "WIDTH",
     "AmbiguousPortError",
     "BlacklistedCommandError",
+    "Canvas",
     "ChecksumError",
     "Command",
     "Eilik",
@@ -75,6 +82,8 @@ __all__ = [
     "FirmwareInfo",
     "Frame",
     "FrameError",
+    "GrayImage",
+    "ImageError",
     "Motor",
     "PortBusyError",
     "PortNotFoundError",
@@ -92,8 +101,14 @@ __all__ = [
     "encode_frame",
     "encode_heartbeat",
     "get_pixel",
+    "linear",
     "list_candidate_ports",
+    "load_png",
+    "png_to_framebuffer",
     "rotate180",
     "save_png",
     "set_pixel",
+    "smoothstep",
+    "text_size",
+    "to_framebuffer",
 ]

@@ -10,6 +10,7 @@ __all__ = [
     "EilikError",
     "EilikTimeoutError",
     "FrameError",
+    "ImageError",
     "PortBusyError",
     "PortNotFoundError",
     "ProtocolError",
@@ -72,6 +73,10 @@ class UnsupportedCommandError(EilikError):
             "add it to eilik.protocol.Command after verifying it is non-destructive"
         )
         self.command = command
+
+
+class ImageError(EilikError, ValueError):
+    """A picture could not be decoded or does not have a usable shape."""
 
 
 class EilikTimeoutError(EilikError, TimeoutError):

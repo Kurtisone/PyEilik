@@ -12,7 +12,8 @@ license = { text = "MIT" }
 dependencies = ["pyserial>=3.5"]
 
 [project.optional-dependencies]
-dev = ["pytest>=7", "ruff>=0.5"]
+# Pillow is only used by the test suite, to cross-check the built-in PNG decoder.
+dev = ["pytest>=7", "ruff>=0.5", "pillow>=10"]
 
 [project.scripts]
 eilik-probe = "probe:main"

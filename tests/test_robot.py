@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import itertools
+import time
+
 import pytest
 
 from eilik.errors import ProtocolError, ServoControllerFaultError, ServoRangeWarning
 from eilik.protocol import HEARTBEAT_ENVELOPE_PREFIX, Command
 from eilik.robot import Eilik, FirmwareInfo, _extract_text
 from eilik.screen import FRAMEBUFFER_SIZE, blank, get_pixel, rotate180, set_pixel
-from eilik.servo import Motor, ServoLimits
+from eilik.servo import Motor, ServoLimits, decode_servo_payload, linear
 
 from .fake_robot import PING_PAYLOAD, device_nonce, raw_frame
 
@@ -112,6 +115,83 @@ class TestServos:
         )
         with pytest.raises(ProtocolError, match="servo write failed with status 0x00"):
             robot.write_servos({Motor.BODY: 1500})
+
+
+def sent_positions(fake_robot) -> list[dict[Motor, int]]:
+    """Return the positions carried by every 0xA2 frame the fake received."""
+    return [
+        decode_servo_payload(data)
+        for command, data in fake_robot.received
+        if command == Command.WRITE_SERVOS
+    ]
+
+
+class TestMove:
+    def test_glides_to_the_target(self, robot, fake_robot):
+        started = time.monotonic()
+        assert robot.move({Motor.HEAD: 1700}, duration=0.2, rate=50) == {Motor.HEAD: 1700}
+        assert time.monotonic() - started >= 0.18
+        heads = [frame[Motor.HEAD] for frame in sent_positions(fake_robot)]
+        assert len(heads) == 10
+        assert heads == sorted(heads)
+        assert heads[-1] == 1700
+        assert fake_robot.servos[Motor.HEAD] == 1700
+
+    def test_starts_from_the_position_read_back(self, robot, fake_robot):
+        fake_robot.servos[Motor.BODY] = 1300
+        robot.move({Motor.BODY: 1400}, duration=0.04, rate=100, easing=linear)
+        assert fake_robot.received[0] == (Command.READ_SERVOS, b"")
+        assert [frame[Motor.BODY] for frame in sent_positions(fake_robot)] == [
+            1325,
+            1350,
+            1375,
+            1400,
+        ]
+
+    def test_smoothstep_eases_in_and_out(self, robot, fake_robot):
+        robot.move({Motor.ARM_LEFT: 1900}, duration=0.1, rate=100)
+        positions = [1500] + [frame[Motor.ARM_LEFT] for frame in sent_positions(fake_robot)]
+        steps = [b - a for a, b in itertools.pairwise(positions)]
+        assert steps[0] < steps[len(steps) // 2] > steps[-1]
+
+    def test_zero_duration_is_a_single_write(self, robot, fake_robot):
+        robot.move({Motor.HEAD: 1600}, duration=0)
+        assert sent_positions(fake_robot) == [{Motor.HEAD: 1600}]
+
+    def test_unnamed_motors_are_not_sent(self, robot, fake_robot):
+        robot.move({"head": 1550, 3: 1450}, duration=0.03, rate=100)
+        assert all(set(frame) == {Motor.HEAD, Motor.BODY} for frame in sent_positions(fake_robot))
+
+    def test_target_is_clamped(self, robot, fake_robot):
+        assert robot.move({Motor.HEAD: 9999}, duration=0.03, rate=100) == {Motor.HEAD: 1800}
+        assert max(frame[Motor.HEAD] for frame in sent_positions(fake_robot)) == 1800
+
+    def test_warns_once_for_the_target_not_for_every_step(self, fake_robot, transport):
+        instance = Eilik(transport=transport, limits=ServoLimits.widened(HEAD=(1000, 2000)))
+        with pytest.warns(ServoRangeWarning) as record:
+            instance.move({Motor.HEAD: 1950}, duration=0.1, rate=100)
+        assert len(record) == 1
+        assert fake_robot.servos[Motor.HEAD] == 1950
+
+    def test_refuses_to_animate_a_wedged_controller(self, robot, fake_robot):
+        fake_robot.servo_fault = True
+        with pytest.raises(ServoControllerFaultError):
+            robot.move({Motor.HEAD: 1600}, duration=0.1)
+        assert sent_positions(fake_robot) == []
+
+    @pytest.mark.parametrize(
+        ("positions", "options"),
+        [
+            ({Motor.HEAD: 1600}, {"duration": -1}),
+            ({Motor.HEAD: 1600}, {"rate": 0}),
+            ({}, {}),
+            ({"tail": 1500}, {}),
+        ],
+    )
+    def test_bad_arguments_send_nothing(self, robot, fake_robot, positions, options):
+        with pytest.raises(ValueError):
+            robot.move(positions, **options)
+        assert fake_robot.received == []
 
 
 class TestScreen:

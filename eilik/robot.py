@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping, Sequence
+import time
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 
 from . import screen as screen_module
+from .canvas import Canvas
 from .errors import ProtocolError, ServoControllerFaultError
 from .protocol import HEARTBEAT_ENVELOPE_PREFIX, SUBCOMMAND_HEARTBEAT, Command
 from .servo import (
@@ -15,12 +17,19 @@ from .servo import (
     decode_servo_payload,
     encode_servo_payload,
     neutral_positions,
+    resolve_positions,
+    smoothstep,
 )
 from .transport import DEFAULT_BAUDRATE, SerialTransport
 
 __all__ = ["Eilik", "FirmwareInfo"]
 
 _log = logging.getLogger(__name__)
+
+#: Default number of position updates per second during :meth:`Eilik.move`.
+#: The servos cannot follow much more, and the reference player sends motion at
+#: 10 Hz; 20 keeps short moves smooth while leaving the link mostly idle.
+DEFAULT_MOVE_RATE = 20.0
 
 #: Status byte the firmware returns in a 0xA2 / 0xA4 acknowledgement on success.
 STATUS_OK = 0x01
@@ -287,12 +296,84 @@ class Eilik:
         self._check_status(frame.data, "servo write")
         return decode_servo_payload(payload)
 
-    def write_screen(self, framebuffer: Sequence[int], timeout: float | None = None) -> None:
+    def move(
+        self,
+        positions: Mapping[object, int],
+        duration: float = 0.5,
+        rate: float = DEFAULT_MOVE_RATE,
+        easing: Callable[[float], float] = smoothstep,
+        timeout: float | None = None,
+    ) -> dict[Motor, int]:
+        """Glide servos to new positions over ``duration`` seconds.
+
+        The movement starts from the positions read back with
+        :meth:`read_servos`, so it refuses to run on a wedged servo controller
+        rather than animate a robot that will not move. Targets are clamped
+        once, up front, which is also when any
+        :class:`~eilik.errors.ServoRangeWarning` is raised. The intermediate
+        positions then go out ``rate`` times a second on a fixed schedule, so a
+        slow exchange does not stretch the movement, and each waits for its
+        acknowledgement like any other write.
+
+        Motors not named in ``positions`` are not sent and hold still.
+
+        Args:
+            positions: Motor (a :class:`Motor`, an id or a name) to target.
+            duration: Seconds the movement should take; 0 sends the targets in
+                a single frame.
+            rate: Position updates per second.
+            easing: Maps progress in 0..1 to the fraction of the way covered.
+                :func:`~eilik.servo.smoothstep` (the default) starts and stops
+                gently; :func:`~eilik.servo.linear` keeps a constant speed.
+            timeout: Seconds to wait for each reply.
+
+        Returns:
+            The target positions, after clamping.
+
+        Raises:
+            ValueError: If ``duration`` is negative, ``rate`` is not positive,
+                or ``positions`` is invalid as for :meth:`write_servos`.
+            ServoControllerFaultError: If the servo controller is wedged.
+            EilikTimeoutError: If the robot stops answering.
+        """
+        if duration < 0:
+            raise ValueError(f"duration must not be negative, got {duration}")
+        if rate <= 0:
+            raise ValueError(f"rate must be positive, got {rate}")
+
+        targets = resolve_positions(positions, self.limits)
+        start = self.read_servos(timeout=timeout)
+        steps = max(1, round(duration * rate))
+        interval = duration / steps
+        began = time.monotonic()
+
+        for step in range(1, steps + 1):
+            delay = began + step * interval - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
+            fraction = easing(step / steps) if step < steps else 1.0
+            frame = {
+                motor: round(
+                    start.get(motor, target) + (target - start.get(motor, target)) * fraction
+                )
+                for motor, target in targets.items()
+            }
+            # The targets were checked above; the steps between them and the
+            # starting point need no warning of their own.
+            payload = encode_servo_payload(frame, self.limits, warn=False)
+            reply = self.transport.request(Command.WRITE_SERVOS, payload, timeout=timeout)
+            self._check_status(reply.data, "servo write")
+        return targets
+
+    def write_screen(
+        self, framebuffer: Sequence[int] | Canvas, timeout: float | None = None
+    ) -> None:
         """Replace the display contents.
 
         Args:
-            framebuffer: A 1024-byte buffer the right way up; the 180-degree
-                rotation the panel needs is applied here.
+            framebuffer: A 1024-byte buffer the right way up, or a
+                :class:`~eilik.canvas.Canvas`; the 180-degree rotation the panel
+                needs is applied here.
             timeout: Seconds to wait for the acknowledgement.
 
         Raises:
