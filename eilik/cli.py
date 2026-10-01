@@ -9,6 +9,11 @@ Run as ``eilik`` once installed, or ``python -m eilik``::
     eilik center
     eilik servos
     eilik capture screen.png
+    eilik simulate                         # a virtual robot, for trying things
+
+``eilik simulate`` runs a simulated robot and draws its screen and servos live;
+in another terminal, ``export EILIK_PORT=/tmp/eilik-sim-$UID`` and every command
+above (and any script using the SDK) talks to it instead of a real robot.
 
 Exit status: 0 on success, 1 on an error, 2 on a usage error, 3 when the link
 works but the servo controller reports the all-zero fault and needs a power
@@ -18,18 +23,25 @@ cycle.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import errno
 import logging
+import os
 import sys
+import tempfile
+import time
 from collections.abc import Callable
+from pathlib import Path
 
 from . import __version__
 from .canvas import Canvas, text_size
 from .errors import EilikError, ServoControllerFaultError
 from .image import FIT_MODES, png_to_framebuffer
 from .robot import Eilik
-from .screen import HEIGHT, WIDTH, save_png, to_ascii
+from .screen import HEIGHT, WIDTH, save_png, to_ascii, to_blocks
 from .servo import Motor, describe, linear, neutral_positions, smoothstep
+from .simulator import SimulatedEilik, describe_frame, render
+from .transport import PORT_ENVIRONMENT_VARIABLE
 
 __all__ = ["main"]
 
@@ -93,7 +105,9 @@ def build_parser() -> argparse.ArgumentParser:
         epilog="Exit status: 0 ok, 1 error, 2 usage error, 3 servo controller fault.",
     )
     parser.add_argument("--version", action="version", version=f"pyeilik {__version__}")
-    parser.add_argument("--port", help="serial device; auto-detected when omitted")
+    parser.add_argument(
+        "--port", help=f"serial device; default: ${PORT_ENVIRONMENT_VARIABLE}, else auto-detected"
+    )
     parser.add_argument("--timeout", type=float, default=2.0, help="reply timeout in seconds")
     parser.add_argument("-v", "--verbose", action="store_true", help="log protocol details")
     commands = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
@@ -106,7 +120,7 @@ def build_parser() -> argparse.ArgumentParser:
     text.add_argument("--x", type=int, help="left edge (default: centred)")
     text.add_argument("--y", type=int, help="top edge (default: centred)")
     text.add_argument("--invert", action="store_true", help="dark text on a lit screen")
-    text.add_argument("--preview", action="store_true", help="print it here instead")
+    text.add_argument("--preview", action="store_true", help="draw it here instead, no robot")
 
     show = commands.add_parser("show", help="show a PNG image on the screen")
     show.add_argument("image", help="path to a PNG file")
@@ -116,7 +130,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--threshold", type=_int_in(0, 256), default=128, help="lit from this luminance (0-256)"
     )
     show.add_argument("--invert", action="store_true", help="light the dark parts instead")
-    show.add_argument("--preview", action="store_true", help="print it here instead")
+    show.add_argument("--preview", action="store_true", help="draw it here instead, no robot")
 
     commands.add_parser("clear", help="blank the screen")
 
@@ -134,7 +148,109 @@ def build_parser() -> argparse.ArgumentParser:
 
     center = commands.add_parser("center", help="return every servo to neutral")
     center.add_argument("--duration", type=_duration, default=0.5, help="seconds (default: 0.5)")
+
+    simulate = commands.add_parser("simulate", help="run a virtual robot to try things on")
+    simulate.add_argument(
+        "--link",
+        default=str(Path(tempfile.gettempdir()) / f"eilik-sim-{os.getuid()}"),
+        help="stable path to the simulator's port, kept across reboots (default: %(default)s)",
+    )
+    simulate.add_argument("--instant", action="store_true", help="servos jump, no travel time")
+    simulate.add_argument(
+        "--wedged", action="store_true", help="start with a wedged servo controller"
+    )
+    simulate.add_argument(
+        "--lenient", action="store_true", help="do not crash on interleaved servo and screen frames"
+    )
+    simulate.add_argument("--log", action="store_true", help="print a line per frame, no drawing")
+    simulate.add_argument(
+        "--for", dest="seconds", type=_duration, help="stop after this many seconds"
+    )
     return parser
+
+
+# -- the simulator ---------------------------------------------------------------
+
+
+def _point_link(link: Path, port: str) -> None:
+    """Make ``link`` a symlink to ``port``, atomically, refusing to clobber a file."""
+    if link.exists() and not link.is_symlink():
+        raise FileExistsError(f"{link} exists and is not a symlink; pass --link elsewhere")
+    staging = link.with_name(link.name + ".new")
+    with contextlib.suppress(FileNotFoundError):
+        staging.unlink()
+    staging.symlink_to(port)
+    staging.replace(link)
+
+
+def _reboot(crashed: SimulatedEilik, options: dict[str, bool]) -> SimulatedEilik:
+    """Bring a crashed simulator back the way the robot comes back.
+
+    It re-enumerates on a new port, its joints are wherever they physically
+    were, and its servo controller stays wedged until a power cycle.
+    """
+    revived = SimulatedEilik(servo_fault=True, **options)
+    revived.servos.update(crashed.positions())
+    revived.violations = list(crashed.violations)
+    crashed.close()
+    return revived
+
+
+def _simulate(args: argparse.Namespace) -> int:
+    """Run ``eilik simulate`` until interrupted or ``--for`` elapses."""
+    link = Path(args.link)
+    options = {"slew": not args.instant, "strict": not args.lenient}
+    sim = SimulatedEilik(servo_fault=args.wedged, **options)
+    interactive = sys.stdout.isatty() and not args.log
+    deadline = None if args.seconds is None else time.monotonic() + args.seconds
+    hint = f"export {PORT_ENVIRONMENT_VARIABLE}={link}"
+    shown_frames = shown_violations = 0
+    drawn = None
+    try:
+        _point_link(link, sim.port)
+        if interactive:
+            sys.stdout.write("\x1b[?1049h\x1b[?25l")  # alternate screen, hidden cursor
+        else:
+            print(f"simulated Eilik on {sim.port}, linked at {link}", flush=True)
+            print(f"in another terminal: {hint}", flush=True)
+        while deadline is None or time.monotonic() < deadline:
+            if sim.crashed:
+                sim = _reboot(sim, options)
+                _point_link(link, sim.port)
+                shown_frames = 0
+                if not interactive:
+                    print(
+                        "the robot crashed and dropped off the bus; it came back with its "
+                        "servo controller wedged (restart the simulator to power-cycle)",
+                        flush=True,
+                    )
+            if interactive:
+                picture = render(sim, f"Eilik simulator \u00b7 {hint} \u00b7 Ctrl-C to stop")
+                if picture != drawn:
+                    sys.stdout.write("\x1b[H\x1b[2J" + picture)
+                    sys.stdout.flush()
+                    drawn = picture
+            else:
+                for command, data in sim.received[shown_frames:]:
+                    print(describe_frame(command, data), flush=True)
+                shown_frames = len(sim.received)
+                for violation in sim.violations[shown_violations:]:
+                    print(f"! {violation}", flush=True)
+                shown_violations = len(sim.violations)
+            time.sleep(0.05)
+    except KeyboardInterrupt:
+        pass
+    except OSError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        if interactive:
+            sys.stdout.write("\x1b[?25h\x1b[?1049l")
+            sys.stdout.flush()
+        sim.close()
+        if link.is_symlink() and str(link.readlink()) == sim.port:
+            link.unlink()
+    return 0
 
 
 # -- rendering, which needs no robot -------------------------------------------
@@ -214,6 +330,8 @@ def main(argv: list[str] | None = None) -> int:
         args.positions
     ):
         parser.error("each motor may appear only once")
+    if args.command == "simulate":
+        return _simulate(args)
 
     try:
         picture = None
@@ -222,7 +340,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "show":
             picture = _render_image(args)
         if picture is not None and args.preview:
-            print(picture.to_ascii())
+            print(to_blocks(bytes(picture)))
             return 0
 
         with Eilik(port=args.port, timeout=args.timeout) as robot:

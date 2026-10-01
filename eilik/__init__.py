@@ -58,7 +58,14 @@ from .screen import (
     set_pixel,
 )
 from .servo import NEUTRAL_POSITION, VERIFIED_RANGES, Motor, ServoLimits, linear, smoothstep
-from .transport import DEFAULT_BAUDRATE, SerialTransport, autodetect_port, list_candidate_ports
+from .simulator import SimulatedEilik
+from .transport import (
+    DEFAULT_BAUDRATE,
+    SerialTransport,
+    autodetect_port,
+    default_port,
+    list_candidate_ports,
+)
 
 __version__ = "0.2.0"
 
@@ -92,12 +99,14 @@ __all__ = [
     "ServoControllerFaultError",
     "ServoLimits",
     "ServoRangeWarning",
+    "SimulatedEilik",
     "UnsupportedCommandError",
     "__version__",
     "autodetect_port",
     "blank",
     "checksum",
     "decode_frame",
+    "default_port",
     "encode_frame",
     "encode_heartbeat",
     "get_pixel",

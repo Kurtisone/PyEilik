@@ -37,7 +37,7 @@ from eilik import (
     screen,
 )
 from eilik.servo import describe
-from eilik.transport import DEFAULT_BAUDRATE, autodetect_port, describe_ports
+from eilik.transport import DEFAULT_BAUDRATE, default_port, describe_ports
 
 #: How far from neutral the optional test movement travels, in pulse-width units.
 TEST_MOVEMENT_OFFSET = 150
@@ -50,7 +50,7 @@ def build_parser() -> argparse.ArgumentParser:
         description=__doc__.split("\n\n")[1],
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--port", help="serial device; auto-detected when omitted")
+    parser.add_argument("--port", help="serial device; default: $EILIK_PORT, else auto-detected")
     parser.add_argument(
         "--baudrate",
         type=int,
@@ -162,7 +162,7 @@ def main(argv: list[str] | None = None) -> int:
         return list_ports()
 
     try:
-        port = args.port or autodetect_port()
+        port = args.port or default_port()
     except EilikError as exc:
         print(f"\nerror: {exc}")
         print("run `python probe.py --list` to see what is attached")

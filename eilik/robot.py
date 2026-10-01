@@ -131,7 +131,8 @@ class Eilik:
         ...     framebuffer = robot.read_screen()
 
     Args:
-        port: Device path; ``None`` auto-detects a single ``/dev/ttyACM*``.
+        port: Device path; ``None`` uses ``EILIK_PORT`` if set, else
+            auto-detects a single ``/dev/ttyACM*``.
         baudrate: Nominal line rate, see :mod:`eilik.transport`.
         timeout: Seconds to wait for a reply.
         limits: Servo position limits. Defaults to the verified ranges.
