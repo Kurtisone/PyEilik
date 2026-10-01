@@ -19,6 +19,7 @@ Example:
     ...     robot.write_screen(canvas)
 """
 
+from .animation import Animation, PlaybackReport, load_animation, play
 from .canvas import Canvas, text_size
 from .errors import (
     AmbiguousPortError,
@@ -36,6 +37,7 @@ from .errors import (
     ServoRangeWarning,
     UnsupportedCommandError,
 )
+from .gif import load_gif
 from .image import GrayImage, load_png, png_to_framebuffer, to_framebuffer
 from .protocol import (
     BLACKLISTED_COMMANDS,
@@ -58,9 +60,16 @@ from .screen import (
     set_pixel,
 )
 from .servo import NEUTRAL_POSITION, VERIFIED_RANGES, Motor, ServoLimits, linear, smoothstep
-from .transport import DEFAULT_BAUDRATE, SerialTransport, autodetect_port, list_candidate_ports
+from .simulator import SimulatedEilik
+from .transport import (
+    DEFAULT_BAUDRATE,
+    SerialTransport,
+    autodetect_port,
+    default_port,
+    list_candidate_ports,
+)
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "BLACKLISTED_COMMANDS",
@@ -71,6 +80,7 @@ __all__ = [
     "VERIFIED_RANGES",
     "WIDTH",
     "AmbiguousPortError",
+    "Animation",
     "BlacklistedCommandError",
     "Canvas",
     "ChecksumError",
@@ -85,6 +95,7 @@ __all__ = [
     "GrayImage",
     "ImageError",
     "Motor",
+    "PlaybackReport",
     "PortBusyError",
     "PortNotFoundError",
     "ProtocolError",
@@ -92,18 +103,23 @@ __all__ = [
     "ServoControllerFaultError",
     "ServoLimits",
     "ServoRangeWarning",
+    "SimulatedEilik",
     "UnsupportedCommandError",
     "__version__",
     "autodetect_port",
     "blank",
     "checksum",
     "decode_frame",
+    "default_port",
     "encode_frame",
     "encode_heartbeat",
     "get_pixel",
     "linear",
     "list_candidate_ports",
+    "load_animation",
+    "load_gif",
     "load_png",
+    "play",
     "png_to_framebuffer",
     "rotate180",
     "save_png",

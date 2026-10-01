@@ -33,6 +33,7 @@ __all__ = [
     "save_png",
     "set_pixel",
     "to_ascii",
+    "to_blocks",
 ]
 
 #: Display width in pixels.
@@ -145,6 +146,23 @@ def to_ascii(framebuffer: Sequence[int], lit: str = "#", dark: str = ".") -> str
     an image viewer.
     """
     return "\n".join("".join(lit if px else dark for px in row) for row in to_rows(framebuffer))
+
+
+#: Half-block characters indexed by ``top | bottom << 1``.
+_BLOCKS = (" ", "\u2580", "\u2584", "\u2588")
+
+
+def to_blocks(framebuffer: Sequence[int]) -> str:
+    """Render the framebuffer with Unicode half blocks, two pixel rows per line.
+
+    The whole screen fits in 128 columns by 32 lines, half the height of
+    :func:`to_ascii`, and keeps the panel's proportions in most terminal fonts.
+    """
+    rows = to_rows(framebuffer)
+    return "\n".join(
+        "".join(_BLOCKS[top | bottom << 1] for top, bottom in zip(upper, lower, strict=True))
+        for upper, lower in zip(rows[0::2], rows[1::2], strict=True)
+    )
 
 
 def _png_chunk(tag: bytes, payload: bytes) -> bytes:

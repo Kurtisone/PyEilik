@@ -24,6 +24,7 @@ import contextlib
 import errno
 import fcntl
 import logging
+import os
 import sys
 import termios
 import threading
@@ -55,8 +56,10 @@ from .protocol import (
 
 __all__ = [
     "DEFAULT_BAUDRATE",
+    "PORT_ENVIRONMENT_VARIABLE",
     "SerialTransport",
     "autodetect_port",
+    "default_port",
     "list_candidate_ports",
 ]
 
@@ -64,6 +67,10 @@ _log = logging.getLogger(__name__)
 
 #: Nominal line rate. See the module docstring: the value is not load-bearing.
 DEFAULT_BAUDRATE = 125000
+
+#: Environment variable naming the port to use when none is given, e.g. a
+#: simulator's, or one robot among several.
+PORT_ENVIRONMENT_VARIABLE = "EILIK_PORT"
 
 #: Directory and glob pattern matching the CDC-ACM nodes the robot shows up on.
 ACM_DIRECTORY = Path("/dev")
@@ -149,11 +156,26 @@ def autodetect_port() -> str:
     candidates = _acm_devices()
     if not candidates:
         raise PortNotFoundError(
-            f"no device matching {ACM_GLOB}; plug the robot in and check `dmesg | tail`"
+            f"no device matching {ACM_GLOB}; plug the robot in and check `dmesg | tail`, "
+            f"or set {PORT_ENVIRONMENT_VARIABLE} (e.g. to a simulator's port)"
         )
     if len(candidates) > 1:
         raise AmbiguousPortError(candidates)
     return candidates[0]
+
+
+def default_port() -> str:
+    """Return the port to use when none is given.
+
+    :data:`PORT_ENVIRONMENT_VARIABLE` wins when set; otherwise the single
+    attached robot is auto-detected with :func:`autodetect_port`.
+
+    Raises:
+        PortNotFoundError: If the variable is unset and no robot is attached.
+        AmbiguousPortError: If the variable is unset and several candidates
+            are attached.
+    """
+    return os.environ.get(PORT_ENVIRONMENT_VARIABLE) or autodetect_port()
 
 
 def _read_termios2_speed(fd: int) -> int | None:
@@ -210,7 +232,8 @@ class SerialTransport:
     :meth:`request` holds a lock across the whole send/receive exchange.
 
     Args:
-        port: Device path. ``None`` runs :func:`autodetect_port`.
+        port: Device path. ``None`` uses :func:`default_port`: the
+            ``EILIK_PORT`` environment variable, else auto-detection.
         baudrate: Nominal line rate; see the module docstring.
         timeout: Default seconds to wait for a reply.
         inter_frame_delay: Minimum pause between consecutive transmissions.
@@ -218,7 +241,7 @@ class SerialTransport:
             cannot open the same robot and interleave its frames with ours.
 
     Raises:
-        PortNotFoundError: If ``port`` is None and no robot is attached.
+        PortNotFoundError: If no robot is attached, or ``port`` does not exist.
         AmbiguousPortError: If ``port`` is None and several candidates exist.
         PortBusyError: If another connection already holds the port.
         serial.SerialException: For any other failure to open the port, such
@@ -234,7 +257,7 @@ class SerialTransport:
         exclusive: bool = True,
     ) -> None:
         """Open the serial port and configure the line rate."""
-        self.port = port or autodetect_port()
+        self.port = port or default_port()
         self.baudrate = baudrate
         self.timeout = timeout
         self.inter_frame_delay = inter_frame_delay
@@ -256,10 +279,11 @@ class SerialTransport:
         self.reset_input()
 
     def _open(self, baudrate: int, exclusive: bool) -> serial.Serial:
-        """Open the port 8N1 at ``baudrate``, translating a busy port.
+        """Open the port 8N1 at ``baudrate``, translating the common failures.
 
         Raises:
             PortBusyError: If another connection holds the port.
+            PortNotFoundError: If the device node does not exist.
         """
         try:
             return serial.Serial(
@@ -275,6 +299,11 @@ class SerialTransport:
         except serial.SerialException as exc:
             if exc.errno in _BUSY_ERRNOS:
                 raise PortBusyError(self.port) from exc
+            if exc.errno == errno.ENOENT:
+                raise PortNotFoundError(
+                    f"{self.port} does not exist; is the robot plugged in? "
+                    "Check `dmesg | tail` and `python probe.py --list`"
+                ) from exc
             raise
 
     @contextlib.contextmanager

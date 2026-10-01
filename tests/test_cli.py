@@ -2,16 +2,24 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
+import threading
+import time
 
 import pytest
 
 from eilik.canvas import Canvas, text_size
 from eilik.cli import EXIT_SERVO_FAULT, main
+from eilik.errors import PortNotFoundError, ServoControllerFaultError
 from eilik.image import load_png
+from eilik.protocol import Command, encode_frame
+from eilik.robot import Eilik
 from eilik.screen import HEIGHT, WIDTH, rotate180
 from eilik.servo import Motor
+from eilik.simulator import SimulatedEilik, render
+from eilik.transport import default_port
 
 
 def run(fake_robot, *args: str) -> int:
@@ -63,9 +71,9 @@ class TestText:
     def test_preview_needs_no_robot(self, capsys):
         assert main(["--port", "/dev/does-not-exist", "text", "Hi", "--preview"]) == 0
         art = capsys.readouterr().out.splitlines()
-        assert len(art) == HEIGHT
+        assert len(art) == HEIGHT // 2  # two pixel rows per line
         assert all(len(line) == WIDTH for line in art)
-        assert any("#" in line for line in art)
+        assert any("\u2588" in line for line in art)
 
     @pytest.mark.parametrize("scale", ["0", "-2", "big"])
     def test_bad_scale_is_a_usage_error(self, fake_robot, scale):
@@ -89,7 +97,9 @@ class TestShow:
 
     def test_preview(self, picture, capsys):
         assert main(["show", str(picture), "--dither", "--preview"]) == 0
-        assert capsys.readouterr().out.splitlines()[15][15] == "#"
+        art = capsys.readouterr().out.splitlines()
+        assert art[7][15] == "\u2588"  # pixels (15, 14) and (15, 15), inside the square
+        assert art[7][60] == " "
 
     def test_missing_file(self, fake_robot, tmp_path, capsys):
         assert run(fake_robot, "show", str(tmp_path / "nope.png")) == 1
@@ -187,3 +197,119 @@ class TestConnection:
         )
         assert result.returncode == 0
         assert result.stdout.startswith("pyeilik ")
+
+
+class TestEnvironmentPort:
+    def test_eilik_port_is_used_when_no_port_is_given(self, fake_robot, monkeypatch):
+        monkeypatch.setenv("EILIK_PORT", fake_robot.port)
+        assert default_port() == fake_robot.port
+        with Eilik() as robot:
+            assert robot.transport.port == fake_robot.port
+        assert main(["servos"]) == 0
+
+    def test_an_explicit_port_wins(self, fake_robot, monkeypatch):
+        monkeypatch.setenv("EILIK_PORT", "/dev/does-not-exist")
+        assert run(fake_robot, "servos") == 0
+
+    def test_the_missing_robot_message_mentions_it(self, monkeypatch):
+        monkeypatch.delenv("EILIK_PORT", raising=False)
+        monkeypatch.setattr("eilik.transport._acm_devices", list)
+        with pytest.raises(PortNotFoundError, match="EILIK_PORT"):
+            default_port()
+
+
+class SimulateRun:
+    """``eilik simulate --log`` running in a thread, for the length of a test."""
+
+    def __init__(self, link, *extra: str, seconds: float = 3.0) -> None:
+        """Start the simulator and wait for its link to appear."""
+        self.link = link
+        self.status: list[int] = []
+        self.thread = threading.Thread(
+            target=lambda: self.status.append(
+                main(["simulate", "--log", "--link", str(link), "--for", str(seconds), *extra])
+            )
+        )
+        self.thread.start()
+        self.wait_for(link.is_symlink)
+
+    @staticmethod
+    def wait_for(condition, timeout: float = 3.0) -> None:
+        deadline = time.monotonic() + timeout
+        while not condition():
+            assert time.monotonic() < deadline, "timed out"
+            time.sleep(0.02)
+
+    def join(self) -> int:
+        self.thread.join(timeout=10)
+        return self.status[0]
+
+
+class TestSimulate:
+    def test_commands_reach_the_simulator_through_the_link(self, tmp_path, capsys, monkeypatch):
+        link = tmp_path / "sim"
+        session = SimulateRun(link, "--instant", seconds=1.0)
+        monkeypatch.setenv("EILIK_PORT", str(link))
+        assert main(["text", "Hi"]) == 0
+        assert main(["move", "HEAD=1650", "--duration", "0"]) == 0
+        assert session.join() == 0
+        out = capsys.readouterr().out
+        assert "in another terminal: export EILIK_PORT=" in out
+        assert "0xA4 write screen, 1024 bytes" in out
+        assert "0xA2 write servos" in out
+        assert not link.exists() and not link.is_symlink()  # cleaned up
+
+    def test_a_crash_reboots_it_wedged_on_a_new_port(self, tmp_path, capsys):
+        link = tmp_path / "sim"
+        session = SimulateRun(link, seconds=2.0)
+        first_port = str(link.readlink())
+        fd = os.open(link, os.O_RDWR | os.O_NOCTTY)
+        try:
+            os.write(
+                fd,
+                encode_frame(Command.WRITE_SCREEN, bytes(1024))
+                + encode_frame(Command.WRITE_SERVOS, b"\x01\x04\xdc\x05"),
+            )
+        finally:
+            os.close(fd)
+        session.wait_for(lambda: link.is_symlink() and str(link.readlink()) != first_port)
+        with Eilik(port=str(link)) as robot, pytest.raises(ServoControllerFaultError):
+            robot.read_servos()
+        assert session.join() == 0
+        out = capsys.readouterr().out
+        assert "crashed and dropped off the bus" in out
+        assert "! 0xA2 arrived while 0xA4 was still being processed" in out
+
+    def test_refuses_to_replace_a_regular_file(self, tmp_path, capsys):
+        precious = tmp_path / "notes.txt"
+        precious.write_text("keep me")
+        assert main(["simulate", "--link", str(precious), "--for", "0"]) == 1
+        assert precious.read_text() == "keep me"
+        assert "not a symlink" in capsys.readouterr().err
+
+    def test_draws_on_a_terminal(self, tmp_path, capsys, monkeypatch):
+        monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
+        assert main(["simulate", "--link", str(tmp_path / "sim"), "--for", "0.2"]) == 0
+        out = capsys.readouterr().out
+        assert out.startswith("\x1b[?1049h")  # alternate screen
+        assert "Ctrl-C to stop" in out
+        assert out.endswith("\x1b[?1049l")  # terminal restored
+
+
+class TestRender:
+    def test_layout(self):
+        with SimulatedEilik(slew=False) as sim:
+            picture = render(sim, "title here")
+        lines = picture.split("\n")
+        assert "title here" in lines[0]
+        assert all(len(line) == WIDTH + 2 for line in lines[:34])
+        assert [line.split()[0] for line in lines[34:38]] == [motor.name for motor in Motor]
+        assert "running" in lines[38]
+
+    def test_reports_faults_and_violations(self):
+        with SimulatedEilik(servo_fault=True) as sim:
+            sim.violations.append("something bad")
+            picture = render(sim)
+        assert "WEDGED" in picture
+        assert " ! something bad" in picture
+        assert "HEAD         0" in picture

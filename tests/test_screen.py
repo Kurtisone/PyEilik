@@ -182,3 +182,25 @@ class TestPng:
     def test_wrong_buffer_size_is_refused(self, tmp_path):
         with pytest.raises(ProtocolError):
             save_png(bytes(10), str(tmp_path / "x.png"))
+
+
+class TestBlocks:
+    def test_shape(self):
+        from eilik.screen import to_blocks
+
+        lines = to_blocks(blank()).split("\n")
+        assert len(lines) == 32
+        assert all(line == " " * 128 for line in lines)
+
+    def test_each_cell_shows_two_pixel_rows(self):
+        from eilik.screen import to_blocks
+
+        framebuffer = blank()
+        set_pixel(framebuffer, 0, 0)  # top only
+        set_pixel(framebuffer, 1, 1)  # bottom only
+        set_pixel(framebuffer, 2, 0)
+        set_pixel(framebuffer, 2, 1)  # both
+        set_pixel(framebuffer, 127, 63)  # bottom-right corner, lower half
+        lines = to_blocks(framebuffer).split("\n")
+        assert lines[0][:4] == "▀▄█ "
+        assert lines[31][127] == "▄"
