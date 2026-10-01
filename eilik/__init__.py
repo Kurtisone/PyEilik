@@ -60,7 +60,7 @@ from .screen import (
 from .servo import NEUTRAL_POSITION, VERIFIED_RANGES, Motor, ServoLimits, linear, smoothstep
 from .transport import DEFAULT_BAUDRATE, SerialTransport, autodetect_port, list_candidate_ports
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "BLACKLISTED_COMMANDS",

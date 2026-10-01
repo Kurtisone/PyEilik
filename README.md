@@ -37,8 +37,12 @@ python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 ```
 
-Requires Python 3.10+ and `pyserial`. Nothing else — PNG export is implemented
-with `zlib` and `struct`, so no imaging library is needed on the target machine.
+Requires Python 3.10+ and `pyserial`. Nothing else: PNG import and export are
+implemented with `zlib` and `struct`, so no imaging library is needed on the
+target machine. (The `dev` extra pulls in Pillow, but only so the test suite
+can cross-check the built-in PNG decoder against it.)
+
+Installing also provides the `eilik` command (or `python -m eilik`).
 
 ### Serial port permissions
 
@@ -55,23 +59,114 @@ On SteamOS remember that `/usr` is read-only by default; a `udev` rule belongs i
 ## Quick start
 
 ```python
-from eilik import Eilik, Motor
+from eilik import Canvas, Eilik, Motor, png_to_framebuffer, save_png
 
 with Eilik() as robot:            # auto-detects a single /dev/ttyACM*
     print(robot.ping())           # firmware identification
     print(robot.read_servos())    # {Motor.ARM_RIGHT: 1500, ...}
 
-    robot.write_servos({Motor.HEAD: 1600, Motor.BODY: 1400})
-    robot.center()                # everything back to 1500
+    robot.move({Motor.HEAD: 1650, Motor.BODY: 1400}, duration=0.8)   # glide there
+    robot.center()                # everything back to 1500, in one frame
 
-    framebuffer = robot.read_screen()       # 1024 bytes, already the right way up
-    from eilik import save_png
-    save_png(framebuffer, "screen.png")
+    canvas = Canvas()
+    canvas.text(10, 25, "Bonjour !", scale=2)
+    robot.write_screen(canvas)
+
+    robot.write_screen(png_to_framebuffer("photo.png", dither=True))
+    save_png(robot.read_screen(), "screen.png")   # already the right way up
 ```
 
 If several `/dev/ttyACM*` nodes are present, auto-detection refuses to guess and
 raises `AmbiguousPortError`; pass `Eilik(port="/dev/ttyACM1")`. Use
 `python probe.py --list` to see the candidates with their USB IDs.
+
+## Command line
+
+```sh
+eilik text "Bonjour !"                     # centred, as large as fits
+eilik text 'Ligne 1\nLigne 2' --scale 1    # \n starts a new line
+eilik show photo.png --dither              # any PNG, fitted to 128x64
+eilik show logo.png --fit cover --invert
+eilik move HEAD=1650 BODY=1400 --duration 1
+eilik center
+eilik servos
+eilik capture screen.png --ascii
+eilik clear
+```
+
+`text` and `show` take `--preview` to print the result as ASCII art instead of
+sending it, which needs no robot at all, so a picture can be tuned before the
+robot is even plugged in. Motors are named `arm_right`, `arm_left`, `body`,
+`head` (any case) or numbered 1 to 4. The exit status is 0 on success, 1 on an
+error, 2 on a usage error and 3 when the servo controller reports the all-zero
+fault described below.
+
+## Drawing and text
+
+`Canvas` wraps a framebuffer with drawing operations. Coordinates start at the
+top-left, the right way up, and everything is clipped at the edges:
+
+```python
+from eilik import Canvas, text_size
+
+canvas = Canvas()                          # or Canvas(robot.read_screen())
+canvas.rect(0, 0, 128, 64)                 # outline; fill=True to fill
+canvas.line(0, 63, 127, 0)
+canvas.circle(100, 32, 12, fill=True)
+canvas.text(4, 4, "Température : 21°")     # built-in 5x7 font
+width, height = text_size("Salut", scale=3)
+canvas.text((128 - width) // 2, 40, "Salut", scale=3)
+canvas.circle(100, 32, 6, value=0, fill=True)   # value=0 erases
+robot.write_screen(canvas)
+print(canvas.to_ascii())                   # preview in the terminal
+```
+
+The font covers printable ASCII and the French accented letters, 21 characters
+per line at scale 1. A character without a glyph is drawn as a hollow box, so
+it shows up instead of silently disappearing. The glyphs live in
+`eilik/font.py` as rows of `#` and `.`, so they can be read and edited in place.
+
+## Images
+
+PNG files are decoded in pure Python: every colour type and bit depth,
+transparency included (interlaced files are not supported). The picture is
+fitted into 128x64 and reduced to one bit per pixel:
+
+```python
+from eilik import png_to_framebuffer
+
+png_to_framebuffer("logo.png")                      # threshold at 128: line art, text
+png_to_framebuffer("photo.png", dither=True)        # Floyd-Steinberg: photos, gradients
+png_to_framebuffer("photo.png", fit="cover")        # fill the screen, crop the overflow
+png_to_framebuffer("drawing.png", invert=True)      # light the dark strokes
+```
+
+`fit` is `contain` (default, letterboxed), `cover` (cropped) or `stretch`.
+Transparent areas and margins are dark unless `background=` says otherwise.
+Dithering preserves brightness, so a dark-blue backdrop becomes a sparse field
+of dots; for logos on a coloured background, a plain threshold usually looks
+cleaner. A 1280x720 photograph decodes in well under a second.
+
+Pixels from another source enter the same path as a `GrayImage`, for example
+from Pillow: `to_framebuffer(GrayImage(im.width, im.height, im.convert("L").tobytes()))`.
+
+## Smooth movement
+
+`write_servos()` sends one frame and the joints move as fast as they can.
+`move()` glides instead:
+
+```python
+from eilik import linear
+
+robot.move({Motor.ARM_LEFT: 1800, Motor.ARM_RIGHT: 1200}, duration=1.0)
+robot.move({"head": 1400}, duration=0.3, easing=linear)   # constant speed
+```
+
+It reads the current positions, then sends intermediate positions 20 times a
+second on a fixed schedule, easing in and out by default. Targets are clamped
+once up front, so widened limits warn once rather than at every step. Because
+it starts from a read-back, `move()` refuses to run on a wedged servo
+controller instead of animating a robot that will not move.
 
 ## Bring-up probe
 
@@ -255,13 +350,15 @@ out of 8192. Nobody has measured this independently yet.
 ## Development
 
 ```sh
-python -m pytest        # 205 tests, no hardware required
+python -m pytest        # 379 tests, no hardware required
 ruff check .
 ```
 
 The suite covers the golden frame vectors (including frames captured from a
-real device), checksums, the safety guard, servo clamping and the screen
-rotation, and additionally runs the transport and the
+real device), checksums, the safety guard, servo clamping, the screen rotation,
+drawing, the PNG decoder and the command line. The decoder is checked against
+an independent test-side encoder covering every filter, colour type and depth,
+and against Pillow. The suite additionally runs the transport, the CLI and the
 high-level API end to end against a **fake robot on a real pty** (see
 `tests/fake_robot.py`) — real file descriptors, real framing, real
 resynchronisation, no hardware attached.
@@ -278,7 +375,7 @@ this implementation's checksum, and the fake robot answers the way it documents.
 reference itself was only exercised on macOS. Still to be confirmed on Linux
 hardware: the ping payload layout, the USB VID/PID (documented nowhere, so not
 hardcoded), and real-world timing. `probe.py` exists to do exactly that;
-please report what it prints. It exits with status 2 if the link works but
+please report what it prints. It exits with status 3 if the link works but
 the servo controller reports the all-zero fault.
 
 ## Credits

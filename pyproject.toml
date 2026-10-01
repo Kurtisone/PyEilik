@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pyeilik"
-version = "0.1.0"
+version = "0.2.0"
 description = "Pure-Python Linux driver for the Energize Lab Eilik desktop robot"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -16,6 +16,7 @@ dependencies = ["pyserial>=3.5"]
 dev = ["pytest>=7", "ruff>=0.5", "pillow>=10"]
 
 [project.scripts]
+eilik = "eilik.cli:main"
 eilik-probe = "probe:main"
 
 [tool.setuptools]

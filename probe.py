@@ -236,7 +236,7 @@ def main(argv: list[str] | None = None) -> int:
     section("done")
     if not servos_ok:
         print("  the link works, but the servo controller needs a power cycle")
-        return 2
+        return 3
     print("  all requested commands completed")
     return 0
 
