@@ -27,6 +27,12 @@ py-modules = ["probe"]
 line-length = 100
 target-version = "py310"
 
+[tool.ruff.format]
+# Code samples in the README are laid out by hand, with aligned comments; they
+# are documentation, so the formatter (which handles Markdown from ruff 0.16)
+# leaves them alone.
+exclude = ["*.md"]
+
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "N", "D", "UP", "B", "C4", "SIM", "RUF", "ARG", "PTH"]
 ignore = [

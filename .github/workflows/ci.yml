@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    # A branch in this repository is already checked by its push; only run the
+    # pull_request copy for pull requests coming from forks.
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # Pinned so that a new ruff release cannot turn CI red without a code
+      # change; bump it deliberately.
+      - run: pip install "ruff==0.16.9"
+      - run: ruff check .
+      - run: ruff format --check .
+
+  test:
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
+    # The transport tests drive a fake robot over a real pty, and the custom
+    # baud-rate path is Linux-only, so tests run on Linux.
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          allow-prereleases: true
+      - run: pip install -e ".[dev]"
+      - run: python -m pytest -q

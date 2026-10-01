@@ -351,8 +351,11 @@ out of 8192. Nobody has measured this independently yet.
 
 ```sh
 python -m pytest        # 379 tests, no hardware required
-ruff check .
+ruff check . && ruff format --check .
 ```
+
+CI (`.github/workflows/ci.yml`) runs both on every push, with the tests on
+Python 3.10 to 3.14.
 
 The suite covers the golden frame vectors (including frames captured from a
 real device), checksums, the safety guard, servo clamping, the screen rotation,
